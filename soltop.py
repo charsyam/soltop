@@ -11,7 +11,7 @@ import subprocess
 import time
 from collections import deque
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 from ctypes import (
     c_void_p,
@@ -754,6 +754,12 @@ def _gpu_client_totals():
     return totals
 
 
+# How many of the top rows get a cpu/memory lookup. render_procs() only ever
+# shows a screenful, so there is no point costing rows past this -- and since
+# idle GPU clients are listed too, a frame carries ~70 of them.
+PROC_STATS_LIMIT = 30
+
+
 def _attach_proc_stats(rows):
     """Fill in each row's cpu_pct and rss_bytes, in one `ps` call for all pids.
 
@@ -761,6 +767,12 @@ def _attach_proc_stats(rows):
     per client -- no memory figure -- so CPU and memory come from the process
     itself. On Apple Silicon memory is unified, so a process's RSS *is* the
     memory it is costing the SoC; there is no separate VRAM number to report.
+
+    This shells out rather than calling proc_pid_rusage() via ctypes, which would
+    be ~2700x cheaper per pid, because rusage is readable only for processes the
+    user owns -- and WindowServer, usually the biggest GPU consumer here, is not
+    one of them. `ps` reports every process, and its ~27ms is a fixed spawn cost
+    (the pid count barely matters), which at a 1s interval is a few percent.
 
     Best-effort: on any failure the fields are simply left as None.
     """
@@ -871,20 +883,29 @@ class ProcGPUSampler:
         self.prev_time = now
         self.started = True
         self._wall_cache = fresh_cache
-        _attach_proc_stats(rows)
         # Busiest first; among the idle ones, most recently active first.
         rows.sort(key=lambda r: (r["gpu_ms_s"],
                                  -(r["last_s"] if r["last_s"] is not None else 1e9)),
                   reverse=True)
+        # Sort BEFORE looking up cpu/memory, and only look them up for the rows a
+        # caller could plausibly display. Since idle GPU clients are listed too,
+        # every frame carried ~70 pids while at most a dozen are ever on screen --
+        # a `ps` over all of them cost ~31ms per frame for nothing.
+        _attach_proc_stats(rows[:PROC_STATS_LIMIT])
         return rows
 
 
 def _fmt_bytes(n):
-    """'1.4G' / '331M' -- a memory figure that fits a narrow column."""
+    """'1.4G' / '331M' -- a memory figure that fits the narrow MEM column.
+
+    Rounds before choosing the unit, so 1023.7 MiB reads as '1.0G' rather than
+    the '1024M' a naive threshold produces.
+    """
     if not n:
         return "-"
-    if n >= 1 << 30:
-        return f"{n / (1 << 30):.1f}G"
+    for unit, scale in (("T", 1 << 40), ("G", 1 << 30)):
+        if round(n / scale, 1) >= 1.0:
+            return f"{n / scale:.1f}{unit}"
     return f"{n / (1 << 20):.0f}M"
 
 

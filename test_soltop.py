@@ -509,6 +509,15 @@ class ProcTableFormattingTests(unittest.TestCase):
         self.assertEqual(soltop._fmt_bytes(331 << 20), "331M")
         self.assertEqual(soltop._fmt_bytes(3 << 30), "3.0G")
 
+    def test_fmt_bytes_rounds_before_picking_the_unit(self):
+        # A naive `n >= 1<<30` threshold renders 1023.7 MiB as "1024M".
+        self.assertEqual(soltop._fmt_bytes(int(1023.7 * (1 << 20))), "1.0G")
+        self.assertEqual(soltop._fmt_bytes(1 << 40), "1.0T")
+
+    def test_fmt_bytes_always_fits_the_mem_column(self):
+        for n in (0, 1 << 20, 1023 << 20, 1 << 30, 900 << 30, 1 << 40):
+            self.assertLessEqual(len(soltop._fmt_bytes(n)), 6, n)
+
     def test_table_shows_gpu_cpu_mem_and_last(self):
         now = time.time()
         rows = [{"pid": 42, "name": "app", "gpu_ms_s": 500.0,
@@ -647,7 +656,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.6.1")
+        self.assertEqual(soltop.__version__, "0.6.2")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200
