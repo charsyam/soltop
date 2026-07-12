@@ -9,7 +9,7 @@ import re
 import time
 from collections import deque
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 from ctypes import (
     c_void_p,
@@ -267,11 +267,9 @@ def discover_state_channels():
 
 # Energy Model channels of interest -> display label. Their delta over the
 # interval is energy consumed, so power (mW) = delta / interval_seconds.
+# "SoC" is derived as the sum of these components.
 ENERGY_KEYS = {"CPU Energy": "CPU", "GPU": "GPU", "ANE": "ANE", "DRAM": "DRAM"}
-# Display order; "SoC" is derived as the sum of the components above.
-POWER_ORDER = ("CPU", "GPU", "ANE", "DRAM", "SoC")
-# Full-scale (mW) for each power bar; the bar still grows if this is exceeded.
-POWER_SCALE = {"CPU": 40000, "GPU": 40000, "ANE": 12000, "DRAM": 15000, "SoC": 80000}
+POWER_LABELS = ("CPU", "GPU", "ANE", "DRAM")
 
 
 # --- DVFS frequency tables (voltage-states in IORegistry, no sudo) -----------
@@ -463,7 +461,6 @@ class Sampler:
         self.last = {}          # key -> most recent entry
         self.order = {}         # group -> [key, ...] preserve observed order
         self.power = {}         # label -> power in mW (from Energy Model)
-        self.power_max = {}     # label -> bar full-scale (floored, for scaling)
         self.power_peak = {}    # label -> true peak mW observed (for display)
         self.power_sum = {}     # label -> cumulative mW (for average)
         self.power_cnt = 0      # number of samples accumulated
@@ -489,10 +486,21 @@ class Sampler:
         self.close()
 
     def _recreate(self):
-        """Release resources and re-subscribe when the subscription drops."""
+        """Release resources and re-subscribe when the subscription drops.
+
+        If re-subscribing fails, close the Sampler for good rather than leaving
+        it with every pointer NULL but closed=False. In that zombie state the
+        next read() would sail past the closed guard, see `not self.prev`, take
+        this same recovery path and silently succeed -- resurrecting an object
+        the caller was told had failed.
+        """
         self._release()
-        self.subscribed, self.chans, self.sub = build_subscription()
-        self.prev = IOR.IOReportCreateSamples(self.subscribed, self.chans, None)
+        try:
+            self.subscribed, self.chans, self.sub = build_subscription()
+            self.prev = IOR.IOReportCreateSamples(self.subscribed, self.chans, None)
+        except BaseException:
+            self.close()
+            raise
         self.prev_time = time.monotonic()
 
     def read(self, interval=1.0):
@@ -519,6 +527,10 @@ class Sampler:
             if not cur or not delta:
                 if cur:
                     CF.CFRelease(cur)
+                # Re-subscribing worked but sampling still fails: give up and
+                # close, or we would leak the fresh subscription and leave a
+                # sampler that says it failed yet still holds native resources.
+                self.close()
                 raise RuntimeError("samples failed (still failing after re-subscribe)")
 
         # The previous sample is no longer needed: release and swap in the new one.
@@ -528,7 +540,7 @@ class Sampler:
         self.prev_time = cur_time
 
         observed = set()
-        current_power = {lbl: 0.0 for lbl in ("CPU", "GPU", "ANE", "DRAM")}
+        current_power = {lbl: 0.0 for lbl in POWER_LABELS}
 
         # Update observed channels with their real active value (0 if idle).
         for chan in iter_channels(delta):
@@ -584,13 +596,10 @@ class Sampler:
         # Missing energy channels mean no value for this delta, not "reuse the
         # previous sample". Reset them to zero to avoid stale power readings.
         self.power = current_power
-        self.power["SoC"] = sum(self.power[l] for l in ("CPU", "GPU", "ANE", "DRAM"))
-        # Bar scale: a sensible per-component full-scale, grown if exceeded.
-        # Also accumulate peak and running average per component.
+        self.power["SoC"] = sum(self.power[l] for l in POWER_LABELS)
+        # Accumulate peak and running average per component, over the session.
         self.power_cnt += 1
         for lbl, mw in self.power.items():
-            floor = POWER_SCALE.get(lbl, 20000.0)
-            self.power_max[lbl] = max(self.power_max.get(lbl, floor), mw)
             self.power_peak[lbl] = max(self.power_peak.get(lbl, 0.0), mw)
             self.power_sum[lbl] = self.power_sum.get(lbl, 0.0) + mw
         power_avg = {lbl: s / self.power_cnt for lbl, s in self.power_sum.items()}
@@ -603,7 +612,7 @@ class Sampler:
                 if key in self.last:
                     dst.append(self.last[key])
         return {"gpu": gpu, "cpu": cpu,
-                "power": dict(self.power), "power_max": dict(self.power_max),
+                "power": dict(self.power),
                 "power_avg": power_avg, "power_peak": dict(self.power_peak)}
 
 
@@ -916,7 +925,7 @@ def organize(raw):
     return {"gpu_pct": gpu_pct, "gpu_channels": gpu_ch, "gpu_mhz": gpu_mhz,
             "gpu_freq_unit": gpu_unit,
             "clusters": out_clusters,
-            "power": raw.get("power", {}), "power_max": raw.get("power_max", {}),
+            "power": raw.get("power", {}),
             "power_avg": raw.get("power_avg", {}), "power_peak": raw.get("power_peak", {})}
 
 
@@ -1011,20 +1020,26 @@ def gauge_bar(frac, width):
     return f"{c}{'█' * filled}{TRACK}{'░' * (width - filled)}{RESET}"
 
 
+def bracket_gauge(frac, width):
+    """The bracketed gauge, '[████░░░░]'. The one place the chrome is defined.
+
+    Both the dashboard (via hgauge) and the per-core view render through this, so
+    the two cannot drift apart -- which is exactly how the per-core bars ended up
+    using a different glyph than the cluster bars.
+    """
+    return f"[{gauge_bar(frac, width)}]"
+
+
 def hgauge(label, frac, width, value=""):
     """asitop-style gauge: a title line, then a filled gauge bar.
 
     Returns a list of two strings.
     """
     title = f"  {label}" + (f"   {value}" if value else "")
-    return [title, f"  [{gauge_bar(frac, width)}]"]
+    return [title, f"  {bracket_gauge(frac, width)}"]
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
-
-
-def _ansi_re():
-    return _ANSI_RE
 
 
 def _visible_len(s):
@@ -1040,7 +1055,7 @@ def _truncate_visible(s, width):
     if _visible_len(s) <= width:
         return s
     out, shown, pos = [], 0, 0
-    for m in _ansi_re().finditer(s):
+    for m in _ANSI_RE.finditer(s):
         for ch in s[pos:m.start()]:
             if shown >= width:
                 return "".join(out) + RESET
@@ -1109,8 +1124,8 @@ def render_cores(view, width, limit=None):
                 break
             cf = _freq_txt(core.get("mhz", 0.0), core.get("freq_unit", "MHz"))
             pct = core["pct"]
-            lines.append("  %-8s [%s] %6.2f%%  %s"
-                         % (core["name"], gauge_bar(pct / 100, bw), pct, cf))
+            lines.append("  %-8s %s %6.2f%%  %s"
+                         % (core["name"], bracket_gauge(pct / 100, bw), pct, cf))
         lines.append("")
     if lines and lines[-1] == "":
         lines.pop()
@@ -1176,7 +1191,6 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
 
     # Power: cur/avg/peak table for components; total as an asitop-style gauge.
     power = view.get("power", {})
-    pmax = view.get("power_max", {})
     pavg = view.get("power_avg", {})
     ppeak = view.get("power_peak", {})
     if power:
@@ -1186,7 +1200,7 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
                 return f"{lbl} {power[lbl] / 1000:.1f}W"
             return (f"{lbl} {power[lbl] / 1000:.1f}/"
                     f"{pavg.get(lbl, 0) / 1000:.1f}/{ppeak.get(lbl, 0) / 1000:.1f}W")
-        comp = " | ".join(triple(lbl) for lbl in ("CPU", "GPU", "ANE", "DRAM") if lbl in power)
+        comp = " | ".join(triple(lbl) for lbl in POWER_LABELS if lbl in power)
         soc_w = power.get("SoC", 0) / 1000
         if single_sample:
             pstats = ""

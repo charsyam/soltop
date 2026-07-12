@@ -26,7 +26,7 @@ class _FakeKeys:
 class _FakeSampler:
     def read(self, interval):
         return {"gpu": [], "cpu": [], "power": {"SoC": 0.0},
-                "power_max": {}, "power_avg": {}, "power_peak": {}}
+                "power_avg": {}, "power_peak": {}}
 
     def close(self):
         pass
@@ -203,8 +203,56 @@ class CoreViewTests(unittest.TestCase):
                               procs=[], height=10, core_only=True)
         self.assertIn("no CPU cores", frame)
 
+    def test_core_and_cluster_gauges_share_the_same_chrome(self):
+        # The per-core view used to hand-build its own bracket, which is how its
+        # bar drifted to a different glyph than the dashboard's. Both must render
+        # through bracket_gauge().
+        shared = soltop.bracket_gauge(0.5, 10)
+        self.assertTrue(shared.startswith("[") and shared.endswith("]"))
+        # The dashboard's gauge line is exactly the shared chrome.
+        self.assertEqual(soltop.hgauge("x", 0.5, 10)[1].strip(), shared)
+        # ...and so is the per-core view's: a 0%-utilised core renders the
+        # all-empty bracket verbatim.
+        view = _core_view(n_e=1, n_p=0)
+        view["clusters"][0]["per_core"][0]["pct"] = 0.0
+        frame = soltop.render(view, cols=90, procs=[], core_only=True)
+        self.assertIn(soltop.bracket_gauge(0.0, 90 - 10 - 32), frame)
+
 
 class SamplerLifecycleTests(unittest.TestCase):
+    def test_failed_resubscribe_closes_instead_of_leaving_a_zombie(self):
+        # _release() nulls every pointer, so if build_subscription() then raises,
+        # the sampler was left closed=False with nothing behind it. The next
+        # read() sailed past the closed guard, saw `not self.prev`, took the
+        # recovery path again and SUCCEEDED -- resurrecting an object the caller
+        # had been told was dead.
+        s = soltop.Sampler()
+        s.read(0.05)
+        with unittest.mock.patch.object(soltop.IOR, "IOReportCreateSamples",
+                                        lambda *a: None), \
+                unittest.mock.patch.object(soltop, "build_subscription",
+                                           side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                s.read(0.05)
+        self.assertTrue(s.closed)
+        with self.assertRaises(RuntimeError):
+            s.read(0.05)
+
+    def test_sampling_still_failing_after_resubscribe_closes_the_sampler(self):
+        # Re-subscribing worked but sampling keeps failing: give up and close,
+        # or the fresh subscription is leaked and the sampler claims to have
+        # failed while still holding native resources.
+        s = soltop.Sampler()
+        s.read(0.05)
+        with unittest.mock.patch.object(soltop.IOR, "IOReportCreateSamples",
+                                        lambda *a: None):
+            with self.assertRaises(RuntimeError):
+                s.read(0.05)
+        self.assertTrue(s.closed)
+        self.assertIsNone(s.subscribed)
+        with self.assertRaises(RuntimeError):
+            s.read(0.05)
+
     def test_read_after_close_raises_instead_of_resurrecting(self):
         # read()'s dropped-subscription recovery cannot distinguish a dead
         # subscription from a deliberately closed one, so without a guard a
@@ -290,7 +338,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.5.2")
+        self.assertEqual(soltop.__version__, "0.5.3")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200
@@ -311,7 +359,6 @@ class SoltopLogicTests(unittest.TestCase):
             "gpu_pct": 0.0,
             "clusters": [],
             "power": {},
-            "power_max": {},
             "power_avg": {},
             "power_peak": {},
         }
@@ -324,7 +371,7 @@ class SoltopLogicTests(unittest.TestCase):
             "gpu_pct": 30.0,
             "clusters": [],
             "power": {"CPU": 1000.0, "SoC": 1000.0},
-            "power_max": {}, "power_avg": {}, "power_peak": {},
+            "power_avg": {}, "power_peak": {},
         }
         frame = soltop.render(view, cols=100, procs=[], single_sample=True)
         self.assertIn("30.0%", frame)
