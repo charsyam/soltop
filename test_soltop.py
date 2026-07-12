@@ -72,6 +72,36 @@ class LiveKeyTests(unittest.TestCase):
         self.assertEqual(self._run_live(["pp", "q"]), [False])
 
 
+class ChannelSelectionTests(unittest.TestCase):
+    """The GPU/CPU subgroups we subscribe to decide whether the numbers mean
+    anything. 'GPU Stats' also exposes latched status registers (Fender State,
+    the AFR/Boost controllers, CLTM) that sit pinned at 100%; averaging those
+    into the GPU figure reported ~40% on a fully idle machine."""
+
+    def test_status_register_subgroups_are_not_treated_as_utilization(self):
+        for bogus in ("Fender State", "UV Warn State", "DVD Request States",
+                      "CLTM-induced GPU Performance States",
+                      "GPU Boost Controller Performance States",
+                      "AFR Power Controller States", "GPU Power Controller States",
+                      "PMU Loop Lost Performance Reason Code States",
+                      "UT Engagement centi-% Histogram"):
+            self.assertNotIn(bogus, soltop._UTIL_SUBGROUPS["gpu"], bogus)
+            u = bogus.upper()
+            picked = ("PERFORMANCE STATE" in u
+                      and not any(b in u for b in soltop._NOT_UTIL))
+            self.assertFalse(picked, f"fallback scan would wrongly pick {bogus!r}")
+
+    def test_canonical_utilization_subgroups_are_selected(self):
+        self.assertIn("GPU Performance States", soltop._UTIL_SUBGROUPS["gpu"])
+        self.assertIn("CPU Core Performance States", soltop._UTIL_SUBGROUPS["cpu"])
+
+    def test_fallback_scan_still_accepts_a_renamed_core_subgroup(self):
+        # A rename must degrade gracefully, not select nothing.
+        u = "GPU Core Performance States".upper()
+        self.assertTrue("PERFORMANCE STATE" in u
+                        and not any(b in u for b in soltop._NOT_UTIL))
+
+
 class SoltopLogicTests(unittest.TestCase):
     def test_active_ratio(self):
         self.assertEqual(soltop.active_ratio({"IDLE": 90, "P0": 10}), 0.1)

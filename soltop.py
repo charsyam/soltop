@@ -174,33 +174,80 @@ def classify_group(group):
     return None
 
 
-def discover_state_channels():
-    """Scan all channels via IOReportCopyAllChannels and auto-discover the
-    GPU/CPU state (residency) subgroups, merging them into one channel set.
+# The subgroups that actually carry utilization residency, in preference order.
+# This must NOT be a loose "anything with STATE in the name" match: 'GPU Stats'
+# alone also exposes Fender State, UV Warn State, CLTM-induced GPU Performance
+# States and the AFR/Boost *controller* states, which are latched status
+# registers that sit pinned at 100%. Averaging those in reported ~40% GPU on a
+# fully idle machine. 'GPU Performance States' (GPUPH) is the channel
+# powermetrics reports as GPU active residency.
+_UTIL_SUBGROUPS = {
+    "gpu": ("GPU Performance States",),
+    "cpu": ("CPU Core Performance States",),
+}
+# Substrings identifying subgroups that are NOT utilization, used only by the
+# fallback scan below if Apple renames the canonical subgroups above.
+_NOT_UTIL = ("CONTROLLER", "CLTM", "FENDER", "WARN", "DVD", "REASON CODE",
+             "HISTOGRAM", "THROTTLER", "COMPLEX", "VOLTAGE")
 
-    Nothing like 'GPU Performance States' is hard-coded, so this keeps working
-    even if Apple renames the group/subgroup (e.g. 'GPU Core States').
+
+def _fallback_state_subgroups(all_ch):
+    """Rename-tolerant scan, used only when no canonical subgroup is present.
+
+    Keeps the original 'works even if Apple renames things' property, but
+    excludes the status-register subgroups that are not utilization.
+    """
+    wanted, seen = [], set()
+    for chan in iter_channels(all_ch):
+        group = from_cfstr(IOR.IOReportChannelGetGroup(chan))
+        subgroup = from_cfstr(IOR.IOReportChannelGetSubGroup(chan))
+        if not (classify_group(group) and subgroup):
+            continue
+        u = subgroup.upper()
+        if "PERFORMANCE STATE" not in u or any(b in u for b in _NOT_UTIL):
+            continue
+        pair = (group, subgroup)
+        if pair not in seen:
+            seen.add(pair)
+            wanted.append(pair)
+    return wanted
+
+
+def discover_state_channels():
+    """Discover the GPU/CPU utilization residency subgroups and merge them.
+
+    Prefers the known utilization subgroups (_UTIL_SUBGROUPS) and falls back to
+    a filtered scan if they are absent, so a rename still degrades gracefully.
+    Selecting here rather than averaging everything matters twice over: it is
+    what makes the reported percentages correct, and copying a channel group
+    costs ~0.1s each, so taking 2 instead of 31 also cuts startup from ~3.2s to
+    ~0.2s.
     """
     all_ch = IOR.IOReportCopyAllChannels(0, 0)
     if not all_ch:
         raise RuntimeError("IOReportCopyAllChannels failed")
 
-    wanted, seen = [], set()
+    available, seen = [], set()
     for chan in iter_channels(all_ch):
         group = from_cfstr(IOR.IOReportChannelGetGroup(chan))
         subgroup = from_cfstr(IOR.IOReportChannelGetSubGroup(chan))
-        if classify_group(group) and subgroup and "STATE" in subgroup.upper():
-            pair = (group, subgroup)
-            if pair not in seen:
-                seen.add(pair)
-                wanted.append(pair)
+        if classify_group(group) and subgroup:
+            seen.add((group, subgroup))
+
+    for kind, names in _UTIL_SUBGROUPS.items():
+        for group, subgroup in seen:
+            if classify_group(group) == kind and subgroup in names:
+                available.append((group, subgroup))
+
+    if not available:
+        available = _fallback_state_subgroups(all_ch)
     CF.CFRelease(all_ch)
 
-    if not wanted:
+    if not available:
         raise RuntimeError("no GPU/CPU state channels found")
 
     base = None
-    for group, subgroup in wanted:
+    for group, subgroup in available:
         ch = copy_group(group, subgroup)
         if not ch:
             continue
