@@ -9,7 +9,7 @@ import re
 import time
 from collections import deque
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 from ctypes import (
     c_void_p,
@@ -385,7 +385,15 @@ def _pstate_index(name):
 
 
 def cluster_freq_mhz(cores, table):
-    """Residency-weighted active DVFS level over a cluster's cores.
+    """Mean DVFS level over the interval, weighted by ALL residency.
+
+    Idle residency counts at the bottom of the ladder, because a parked core is
+    not clocking. Averaging only the active states instead answers "how fast is
+    a core when it happens to be awake", which on Apple Silicon is ~always the
+    top step (a core runs flat out, then drops straight to IDLE) -- that pinned
+    the display near 100% even on an idle machine and carried no information.
+    Weighting all residency gives the mean clock over the interval, which is
+    what powermetrics reports and what actually tracks load.
 
     ``table`` is either a plain ascending list of values or the {"values","unit"}
     dict produced by load_dvfs(). Returns the weighted value (0.0 if unknown);
@@ -397,12 +405,15 @@ def cluster_freq_mhz(cores, table):
     num = den = 0.0
     for core in cores:
         for name, res in core.get("states", {}).items():
-            if res <= 0 or is_idle_state(name):
+            if res <= 0:
                 continue
-            idx = _pstate_index(name)
-            if idx is None:
-                continue
-            idx = max(0, min(len(values) - 1, idx))
+            if is_idle_state(name):
+                idx = 0                     # parked -> bottom of the ladder
+            else:
+                idx = _pstate_index(name)
+                if idx is None:
+                    continue
+                idx = max(0, min(len(values) - 1, idx))
             num += res * values[idx]
             den += res
     return (num / den) if den > 0 else 0.0

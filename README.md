@@ -1,6 +1,6 @@
 # soltop
 
-Current version: **0.4.1**
+Current version: **0.4.2**
 
 An Apple Silicon GPU / CPU / power monitor for the terminal — like `asitop`,
 but **without `sudo` and without `powermetrics`**.
@@ -53,6 +53,11 @@ process list. Press `q` (or `Ctrl-C`) to quit.
   versions normalized it against a hardcoded per-cluster maximum, which produced
   confidently wrong clock numbers on any chip that didn't match. A percentage of
   the cluster's own top DVFS step is what the data actually supports.
+- The reported clock is the **mean over the sampling interval**, with idle
+  residency counted at the bottom of the ladder — the same thing `powermetrics`
+  reports. It is not "the clock while a core happens to be awake", which on
+  Apple Silicon is almost always the top step (a core runs flat out, then drops
+  straight to idle) and so would sit near 100% even on an idle machine.
 
 ## License
 

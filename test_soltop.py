@@ -109,10 +109,20 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop.active_ratio({}), 0.0)
         self.assertIsNone(soltop.active_ratio({"P0": 10, "P1": 20}))
 
-    def test_cluster_frequency_ignores_idle_residency(self):
-        # V ascends with the DVFS step: V1 -> 2000, V2 -> 3000.
+    def test_cluster_frequency_weights_idle_at_the_bottom_of_the_ladder(self):
+        # Idle residency counts at the ladder floor, so the reported clock is the
+        # mean over the interval, not "the clock while awake" (which on Apple
+        # Silicon is ~always the top step and pinned the display near 100%).
+        ladder = [1000, 2000, 3000]
+        # 100 idle @1000 + 20 @2000 + 20 @3000 -> (100000+40000+60000)/140
         cores = [{"states": {"IDLE": 100, "V1P1": 20, "V2P0": 20}}]
-        self.assertEqual(soltop.cluster_freq_mhz(cores, [1000, 2000, 3000]), 2500)
+        self.assertAlmostEqual(soltop.cluster_freq_mhz(cores, ladder), 200000 / 140)
+        # A fully parked cluster sits at the bottom of the ladder.
+        parked = [{"states": {"IDLE": 100, "DOWN": 50}}]
+        self.assertEqual(soltop.cluster_freq_mhz(parked, ladder), 1000)
+        # A fully pegged cluster sits at the top.
+        pegged = [{"states": {"V2P0": 100}}]
+        self.assertEqual(soltop.cluster_freq_mhz(pegged, ladder), 3000)
 
     def test_pstate_index_reads_the_ascending_v_field(self):
         # CPU names are V<v>P<p> with v ascending and p descending, so
@@ -151,7 +161,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.4.1")
+        self.assertEqual(soltop.__version__, "0.4.2")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200
