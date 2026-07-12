@@ -454,6 +454,7 @@ class Sampler:
                 DVFS = load_dvfs()
             except Exception:
                 DVFS = {}
+        self.closed = False
         self.subscribed, self.chans, self.sub = build_subscription()
         self.prev = IOR.IOReportCreateSamples(self.subscribed, self.chans, None)
         self.prev_time = time.monotonic()
@@ -479,6 +480,7 @@ class Sampler:
     def close(self):
         """Release the native subscription and sample objects."""
         self._release()
+        self.closed = True
 
     def __enter__(self):
         return self
@@ -494,6 +496,12 @@ class Sampler:
         self.prev_time = time.monotonic()
 
     def read(self, interval=1.0):
+        # Without this, the dropped-subscription recovery below cannot tell "the
+        # subscription died" from "the caller closed this sampler", so a read()
+        # after close() would silently re-subscribe and leak a native
+        # subscription nobody owns -- making close() a lie.
+        if self.closed:
+            raise RuntimeError("Sampler is closed")
         time.sleep(interval)
 
         cur = IOR.IOReportCreateSamples(self.subscribed, self.chans, None)

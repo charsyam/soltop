@@ -102,6 +102,33 @@ class ChannelSelectionTests(unittest.TestCase):
                         and not any(b in u for b in soltop._NOT_UTIL))
 
 
+class SamplerLifecycleTests(unittest.TestCase):
+    def test_read_after_close_raises_instead_of_resurrecting(self):
+        # read()'s dropped-subscription recovery cannot distinguish a dead
+        # subscription from a deliberately closed one, so without a guard a
+        # read() after close() silently re-subscribed and leaked a native
+        # subscription that nobody would ever release.
+        s = soltop.Sampler()
+        try:
+            s.read(0.05)
+        finally:
+            s.close()
+        with self.assertRaises(RuntimeError):
+            s.read(0.05)
+
+    def test_close_is_idempotent(self):
+        s = soltop.Sampler()
+        s.close()
+        s.close()  # must not raise or double-free
+
+    def test_context_manager_releases_on_exception(self):
+        with self.assertRaises(ValueError):
+            with soltop.Sampler() as s:
+                raise ValueError("boom")
+        self.assertIsNone(s.prev)
+        self.assertTrue(s.closed)
+
+
 class SoltopLogicTests(unittest.TestCase):
     def test_active_ratio(self):
         self.assertEqual(soltop.active_ratio({"IDLE": 90, "P0": 10}), 0.1)
