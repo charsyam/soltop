@@ -9,7 +9,7 @@ import re
 import time
 from collections import deque
 
-__version__ = "0.5.5"
+__version__ = "0.5.6"
 
 from ctypes import (
     c_void_p,
@@ -197,7 +197,18 @@ def _fallback_state_subgroups(seen, kind):
 
     Keeps the original 'works even if Apple renames things' property, but
     excludes the status-register subgroups that are not utilization.
+
+    Returns at most ONE subgroup. Several can match -- this M4 Pro exposes GPU
+    Performance States, AFR Performance States and GPU Software Performance
+    States -- and subscribing to all of them would average them into a single
+    figure, which is exactly the bug that made an idle GPU read ~40%.
+
+    Rank the candidates: the name must lead with the unit itself ("GPU ..." for
+    gpu, "CPU"/"ECPU"/"PCPU ..." for cpu), which drops AFR (the display refresh
+    channel, not GPU compute); then prefer the shortest name, so the plain
+    residency channel beats a qualified variant like "GPU Software ...".
     """
+    prefixes = ("GPU",) if kind == "gpu" else ("CPU", "ECPU", "PCPU")
     wanted = []
     for group, subgroup in seen:
         if classify_group(group) != kind:
@@ -206,7 +217,10 @@ def _fallback_state_subgroups(seen, kind):
         if "PERFORMANCE STATE" not in u or any(b in u for b in _NOT_UTIL):
             continue
         wanted.append((group, subgroup))
-    return wanted
+    if not wanted:
+        return []
+    leading = [p for p in wanted if p[1].upper().startswith(prefixes)] or wanted
+    return [min(leading, key=lambda p: (len(p[1].split()), p[1]))]
 
 
 def discover_state_channels():
@@ -1318,7 +1332,16 @@ def live(interval=1.0, cols_override=None):
     try:
         with KeyReader(sys.stdin) as keys:
             while True:
-                view = organize(sampler.read(interval))
+                try:
+                    view = organize(sampler.read(interval))
+                except RuntimeError:
+                    # read() now closes the Sampler and raises when IOReport
+                    # keeps failing, so a transient hiccup would otherwise kill
+                    # the monitor with a traceback. Rebuild and carry on; if the
+                    # rebuild fails too, the error is real and propagates.
+                    sampler.close()
+                    sampler = Sampler()
+                    continue
                 gpu_hist.append(view["gpu_pct"])
                 soc_hist.append(view.get("power", {}).get("SoC", 0) / 1000)
                 try:

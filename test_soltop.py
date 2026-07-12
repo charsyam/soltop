@@ -107,6 +107,39 @@ class LiveKeyTests(unittest.TestCase):
                          ["proc", "core", "proc"])
 
 
+class LiveRecoveryTests(unittest.TestCase):
+    def test_live_survives_a_transient_sampler_failure(self):
+        # read() closes the Sampler and raises when IOReport keeps failing. live()
+        # caught only KeyboardInterrupt, so that hardening turned a transient
+        # hiccup -- previously recovered from silently -- into a traceback that
+        # killed the monitor.
+        calls = {"n": 0}
+        real_read = soltop.Sampler.read
+
+        def flaky(sampler, interval=1.0):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                sampler.close()
+                raise RuntimeError("samples failed")
+            return real_read(sampler, interval)
+
+        class Keys:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read_available(self):
+                return "q" if calls["n"] > 3 else ""
+
+        with unittest.mock.patch.object(soltop.Sampler, "read", flaky), \
+                unittest.mock.patch.object(soltop, "KeyReader", lambda s: Keys()), \
+                unittest.mock.patch("sys.stdout", new_callable=io.StringIO):
+            soltop.live(interval=0.01)      # must not raise
+        self.assertGreater(calls["n"], 2, "should have sampled past the failure")
+
+
 class ChannelSelectionTests(unittest.TestCase):
     """The GPU/CPU subgroups we subscribe to decide whether the numbers mean
     anything. 'GPU Stats' also exposes latched status registers (Fender State,
@@ -141,6 +174,25 @@ class ChannelSelectionTests(unittest.TestCase):
                       renamed)],
                     "gpu" if renamed.startswith("GPU") else "cpu"),
                 renamed)
+
+    def test_fallback_returns_at_most_one_subgroup(self):
+        # Several subgroups match the filter (this M4 Pro has GPU Performance
+        # States, AFR Performance States AND GPU Software Performance States).
+        # Subscribing to all of them would average them into one figure -- the
+        # very bug that made an idle GPU read ~40%.
+        seen = [("GPU Stats", "GPU Performance States"),
+                ("GPU Stats", "AFR Performance States"),
+                ("GPU Stats", "GPU Software Performance States")]
+        picked = soltop._fallback_state_subgroups(seen, "gpu")
+        self.assertEqual(len(picked), 1)
+        # AFR is the display-refresh channel, not GPU compute: it must not win.
+        self.assertEqual(picked[0][1], "GPU Performance States")
+
+    def test_fallback_prefers_the_plain_channel_over_a_qualified_variant(self):
+        seen = [("GPU Stats", "GPU Software Performance States"),
+                ("GPU Stats", "GPU Performance States")]
+        self.assertEqual(soltop._fallback_state_subgroups(seen, "gpu")[0][1],
+                         "GPU Performance States")
 
     def test_fallback_still_rejects_aggregates_and_status_registers(self):
         seen = [("CPU Stats", "CPU Complex Performance States"),
@@ -398,7 +450,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.5.5")
+        self.assertEqual(soltop.__version__, "0.5.6")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200
