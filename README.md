@@ -8,6 +8,8 @@ but **without `sudo` and without `powermetrics`**.
 `soltop` reads directly from `IOReport`, IOKit and mach, so it runs with normal
 user privileges.
 
+![soltop running on an Apple M4 Pro](soltop.png)
+
 ## Features
 
 - **GPU** usage + frequency, with a live history graph
