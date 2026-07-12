@@ -590,8 +590,8 @@ class SoltopLogicTests(unittest.TestCase):
         # therefore reads the wrong ladder on the next chip. Bind by the
         # cluster's own P-state count instead.
         tables = {
-            "voltage-states5": [1308, 4608],            # M5: S-cluster (2 steps)
-            "voltage-states22": [1344, 2000, 4380],     # M5: P0/P1     (3 steps)
+            "voltage-states5": ("period", [1308, 4608]),          # M5: S (2 steps)
+            "voltage-states22": ("period", [1344, 2000, 4380]),   # M5: P0/P1 (3)
         }
         self.assertEqual(soltop.match_ladder(2, tables), [1308, 4608])
         self.assertEqual(soltop.match_ladder(3, tables), [1344, 2000, 4380])
@@ -599,10 +599,22 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop.match_ladder(9, tables), [])
         self.assertEqual(soltop.match_ladder(0, tables), [])
 
+    def test_gpu_cannot_bind_a_cpu_ladder(self):
+        # An M5 Pro's GPU exposes 15 P-states -- the same count as its CPU P
+        # ladder. Matching on length alone would render the GPU at 4380 MHz, so
+        # the CPU ('period') and GPU ('absolute') table families are kept apart.
+        tables = {
+            "voltage-states22": ("period", [1344.0] * 15),     # CPU P ladder
+            "voltage-states9": ("absolute", [338.0] * 15),     # GPU ladder
+        }
+        self.assertEqual(soltop.match_ladder(15, tables, "absolute"), [338.0] * 15)
+        self.assertEqual(soltop.match_ladder(15, tables, "period"), [1344.0] * 15)
+
     def test_ladder_prefers_the_non_sram_twin(self):
         # The '-sram' tables carry the same ladder (in kHz), so both decode to
         # the same MHz; pin the choice so it is stable rather than dict-ordered.
-        tables = {"voltage-states5-sram": [1308, 4608], "voltage-states5": [1308, 4608]}
+        tables = {"voltage-states5-sram": ("period", [1308, 4608]),
+                  "voltage-states5": ("period", [1308, 4608])}
         self.assertEqual(soltop.match_ladder(2, tables), [1308, 4608])
 
     def test_decode_ladder_rejects_a_table_it_cannot_read(self):
@@ -610,23 +622,42 @@ class SoltopLogicTests(unittest.TestCase):
         # reported -- a fabricated number is worse than a missing one.
         self.assertIsNone(soltop._decode_ladder([1, 1, 1]))
         self.assertIsNone(soltop._decode_ladder([]))
-        # Hz (GPU), kHz ('-sram'), and period (CPU) all decode.
-        self.assertEqual(soltop._decode_ladder([338000000, 1620000000]), [338.0, 1620.0])
-        self.assertEqual(soltop._decode_ladder([1308000, 4608000]), [1308.0, 4608.0])
-        self.assertEqual([round(v) for v in soltop._decode_ladder([50103, 14222])],
-                         [1308, 4608])
+        # Hz (GPU) and kHz ('-sram') are absolute; the CPU tables are periods.
+        self.assertEqual(soltop._decode_ladder([338000000, 1620000000]),
+                         ("absolute", [338.0, 1620.0]))
+        self.assertEqual(soltop._decode_ladder([1308000, 4608000]),
+                         ("absolute", [1308.0, 4608.0]))
+        kind, ladder = soltop._decode_ladder([50103, 14222])
+        self.assertEqual((kind, [round(v) for v in ladder]), ("period", [1308, 4608]))
 
-    def test_cluster_type_keeps_p0_and_p1_apart(self):
-        # IOReport names cores <KIND>CPU<cluster><core><n>. Chips with two
-        # performance clusters (M4 Pro, M5 Pro, every Max/Ultra) must not have
-        # them averaged into one row: a busy cluster and a parked one would
-        # report as a single lukewarm number.
-        self.assertEqual(soltop.cluster_type("PCPU000")[0], "P0")
-        self.assertEqual(soltop.cluster_type("PCPU120")[0], "P1")
-        self.assertEqual(soltop.cluster_type("ECPU010")[0], "E0")
-        # An M5 Pro has S-cores and no E-cores at all, so the kind letter cannot
-        # be matched against an E/P allowlist -- that would drop every core.
-        self.assertEqual(soltop.cluster_type("SCPU000")[0], "S0")
+    def test_m5_core_names_group_into_the_real_clusters(self):
+        # The core naming is chip-specific and the letters INVERT between chips:
+        #   M4 Pro:  ECPU000..ECPU030   PCPU000..PCPU140
+        #   M5 Pro:  PCPU0..PCPU4       MCPU00..MCPU14
+        # so on an M5 'PCPU*' is the 5-core S-cluster and 'MCPU*' the 10
+        # performance cores. Hardcoding the letters (or splitting on the leading
+        # digit regardless) turned PCPU0..PCPU4 into five one-core clusters and
+        # dropped MCPU* into "CPU other".
+        def cores(names):
+            return [{"name": n, "active": 0.0, "states": {}} for n in names]
+
+        # M5 Pro: 1-digit names are core indices within ONE cluster ...
+        m5 = soltop.group_clusters(cores(
+            [f"PCPU{i}" for i in range(5)] +
+            [f"MCPU{c}{i}" for c in (0, 1) for i in range(5)]))
+        self.assertEqual([(c["key"], len(c["cores"])) for c in m5],
+                         [("P", 5), ("P0", 5), ("P1", 5)])
+
+        # ... while 2-3 digit names carry a leading CLUSTER index.
+        m4 = soltop.group_clusters(cores(
+            [f"ECPU0{i}0" for i in range(4)] +
+            [f"PCPU{c}{i}0" for c in (0, 1) for i in range(5)]))
+        self.assertEqual([(c["key"], len(c["cores"])) for c in m4],
+                         [("E", 4), ("P0", 5), ("P1", 5)])
+
+        # An unrecognised name is still shown, never dropped.
+        self.assertEqual([c["key"] for c in soltop.group_clusters(cores(["WEIRD"]))],
+                         ["?"])
 
     def test_nsteps_counts_the_non_idle_states(self):
         # The ladder length is the number of non-idle P-states IOReport names.
@@ -649,26 +680,29 @@ class SoltopLogicTests(unittest.TestCase):
             s[f"V{nsteps - 1}P0"] = top_res
             return s
 
-        raw = {"gpu": [], "cpu": [
-            {"name": "SCPU000", "subgroup": "CPU Core Performance States",
-             "active": 0.06, "states": states(20, 6, {"DOWN": 74, "IDLE": 20})},
-            {"name": "PCPU000", "subgroup": "CPU Core Performance States",
-             "active": 0.99, "states": states(15, 99, {"IDLE": 1})},
-            {"name": "PCPU100", "subgroup": "CPU Core Performance States",
-             "active": 0.0, "states": states(15, 0, {"DOWN": 100})},
-        ]}
+        # The real M5 Pro channel names: PCPU0..4 are the S-cluster, MCPU00..14
+        # are the two performance clusters.
+        sub = "CPU Core Performance States"
+        raw = {"gpu": [], "cpu":
+               [{"name": f"PCPU{i}", "subgroup": sub, "active": 0.06,
+                 "states": states(20, 6, {"DOWN": 74, "IDLE": 20})} for i in range(5)] +
+               [{"name": f"MCPU0{i}", "subgroup": sub, "active": 0.99,
+                 "states": states(15, 99, {"IDLE": 1})} for i in range(5)] +
+               [{"name": f"MCPU1{i}", "subgroup": sub, "active": 0.0,
+                 "states": states(15, 0, {"DOWN": 100})} for i in range(5)]}
         saved = soltop.DVFS
         soltop.DVFS = {
-            "voltage-states5": [1308.0, 4608.0][:1] + [4608.0] * 19,   # 20 steps
-            "voltage-states22": [1344.0] + [4380.0] * 14,              # 15 steps
+            "voltage-states5": ("period", [1308.0] + [4608.0] * 19),    # 20 steps
+            "voltage-states22": ("period", [1344.0] + [4380.0] * 14),   # 15 steps
         }
         try:
             got = {c["key"]: c for c in soltop.organize(raw)["clusters"]}
         finally:
             soltop.DVFS = saved
 
-        self.assertEqual(sorted(got), ["P0", "P1", "S0"])
-        self.assertEqual(got["S0"]["mhz"], 4608.0)   # 20-step ladder, top step
+        self.assertEqual(sorted(got), ["P", "P0", "P1"])
+        self.assertEqual(got["P"]["count"], 5)       # S-cluster: one cluster of 5
+        self.assertEqual(got["P"]["mhz"], 4608.0)    # 20-step ladder, top step
         self.assertEqual(got["P0"]["mhz"], 4380.0)   # 15-step ladder, top step
         # Parked: no active residency to weight, so no clock is claimed.
         self.assertEqual(got["P1"]["avg"], 0.0)

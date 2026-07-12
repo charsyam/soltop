@@ -398,22 +398,28 @@ def _decode_ladder(vals):
     if not vals:
         return None
     lo, hi = _SANE_MHZ
-    for mhz in ([v / 1e6 for v in vals],                    # Hz  -> MHz
-                [v / 1e3 for v in vals],                    # kHz -> MHz (-sram)
-                [CPU_PERIOD_NUMERATOR / v for v in vals]):  # period -> MHz
+    # 'period' identifies a CPU table, 'absolute' (Hz/kHz) a GPU one -- the CPU
+    # tables store the period of each step while the GPU's store plain Hz. The
+    # kind is returned so a GPU channel cannot bind a CPU ladder: on an M5 Pro
+    # the GPU's 15 P-states would otherwise match the 15-step P ladder and
+    # render the GPU at 4380 MHz.
+    for kind, mhz in (("absolute", [v / 1e6 for v in vals]),     # Hz  -> MHz
+                      ("absolute", [v / 1e3 for v in vals]),     # kHz -> MHz (-sram)
+                      ("period", [CPU_PERIOD_NUMERATOR / v for v in vals])):
         ladder = sorted(mhz)
         if lo <= ladder[0] and ladder[-1] <= hi:
-            return ladder
+            return (kind, ladder)
     return None
 
 
 def load_dvfs():
-    """Return {key: [ascending MHz]} for every voltage-states table we can decode.
+    """Return {key: (kind, [ascending MHz])} for every table we can decode.
 
     Keyed by the raw IORegistry key name ('voltage-states5', ...), NOT by
     cluster: which table belongs to which cluster is decided later, by matching
     ladder length against the cluster's P-state count (see match_ladder). The
     numbering differs per chip, so this layer must not presume a mapping.
+    ``kind`` is 'period' for CPU tables and 'absolute' for GPU ones.
     """
     try:
         found = _read_voltage_state_tables()
@@ -422,19 +428,22 @@ def load_dvfs():
     tables = {}
     for key, raw in found.items():
         vals = [f for f in raw[0::2] if f]   # first uint of each (freq, volt) pair
-        ladder = _decode_ladder(vals)
-        if ladder:
-            tables[key] = ladder
+        decoded = _decode_ladder(vals)
+        if decoded:
+            tables[key] = decoded
     return tables
 
 
-def match_ladder(nsteps, tables):
+def match_ladder(nsteps, tables, kind="period"):
     """Pick the DVFS ladder for a cluster with ``nsteps`` P-states, or [].
 
     IOReport reports each core's P-states by name (V0P18, V1P17, ...), so the
-    number of non-idle states IS the length of that cluster's ladder. A table
-    with exactly that many entries is the cluster's ladder; anything else is a
-    different cluster's, or not a CPU table at all.
+    number of non-idle states IS the length of that cluster's ladder. A table of
+    the right ``kind`` with exactly that many entries is the cluster's ladder.
+
+    ``kind`` keeps the CPU and GPU table families apart ('period' vs 'absolute').
+    Length alone is not enough: an M5 Pro's GPU exposes 15 P-states and so would
+    otherwise match the 15-step *CPU* P ladder and report the GPU at 4380 MHz.
 
     Verified on an M5 Pro, where the key numbering is nothing like the M4's:
     S-cluster (20 steps) binds to voltage-states5, P0/P1 (15 steps each) to
@@ -454,8 +463,8 @@ def match_ladder(nsteps, tables):
         num = int(m.group(1)) if m else 1 << 30
         is_sram = bool(m and m.group(2))
         return (is_sram, num)
-    for key, ladder in sorted(tables.items(), key=rank):
-        if len(ladder) == nsteps:
+    for key, (tkind, ladder) in sorted(tables.items(), key=rank):
+        if tkind == kind and len(ladder) == nsteps:
             return ladder
     return []
 
@@ -1060,32 +1069,94 @@ def thermal_state():
         return -1
 
 
-_CORE_RE = re.compile(r"^([A-Z]+)CPU(\d)")   # ECPU000 -> ('E', '0'); PCPU120 -> ('P', '1')
+_CORE_RE = re.compile(r"^([A-Z]+)CPU(\d+)$")   # ECPU000 -> ('E','000'); MCPU14 -> ('M','14')
+
+# What a core's letter prefix means, for display only. The prefixes are NOT a
+# fixed vocabulary and must never gate which cores are kept: an M4 Pro reports
+# E/P, while an M5 Pro reports P (its 5 S-cores) and M (its 10 performance
+# cores) -- inverting what 'P' means between the two chips. Anything unlisted
+# still gets grouped and shown, just under its own letter.
+_KIND_LABELS = {"E": "E", "P": "P", "M": "P", "S": "S"}
 
 
-def cluster_type(name):
-    """Classify a core name into (key, label), keeping distinct clusters distinct.
+def _core_kind_and_digits(name):
+    """('M', '14') from 'MCPU14'; (None, None) if the name is not a core."""
+    m = _CORE_RE.match((name or "").upper())
+    if not m:
+        return (None, None)
+    return (m.group(1), m.group(2))
 
-    IOReport names cores <KIND>CPU<cluster><core><n>, so the digit right after
-    'CPU' is the CLUSTER INDEX: PCPU0xx is P0, PCPU1xx is P1. Chips with more
-    than one performance cluster -- an M4 Pro's 10 P-cores, an M5 Pro's P0/P1,
-    any Max/Ultra part -- must not have them averaged into a single "P" row, or
-    a busy cluster and a sleeping one report as one lukewarm number.
 
-    The kind letter is taken from the name rather than matched against a known
-    set: an M5 Pro has S-cores and no E-cores at all, so an E/P allowlist would
-    silently drop every core on the machine.
+def group_clusters(cores):
+    """Group core channels into clusters, deriving the layout from the names.
+
+    IOReport names cores <KIND>CPU<digits>, but the MEANING of those digits is
+    chip-specific and cannot be assumed:
+
+        M4 Pro   ECPU000..ECPU030   PCPU000..PCPU140    <- 3 digits: cluster,core,0
+        M5 Pro   PCPU0..PCPU4       MCPU00..MCPU14      <- S is 1 digit (core only),
+                                                           M is 2 digits (cluster,core)
+
+    So on an M5 'PCPU*' is the S-cluster and 'MCPU*' the performance cores --
+    the letter 'P' means the opposite of what it means on an M4. Hardcoding
+    either the letters or the digit positions therefore mislabels the clusters
+    on the other chip, which is exactly how a P-cluster came to render as
+    "CPU other".
+
+    The layout is instead inferred from the DIGIT COUNT, which is what actually
+    distinguishes the two cases. A name carries a cluster index only if it has
+    room for one *after* the core number:
+
+        PCPU0 .. PCPU4    1 digit  -> core only  => ONE cluster of 5 cores
+        MCPU00 .. MCPU14  2 digits -> cluster,core => TWO clusters of 5
+        PCPU000 .. PCPU140  3 digits -> cluster,core,0 => TWO clusters of 5
+
+    Splitting on the leading digit regardless would turn the M5's five S-cores
+    (PCPU0..PCPU4, five distinct leading digits) into five one-core clusters.
     """
-    u = (name or "").upper()
-    m = _CORE_RE.match(u)
-    if m:
-        kind, idx = m.group(1), m.group(2)
-        return (f"{kind}{idx}", f"CPU {kind}{idx}-cluster")
-    if u.startswith("E"):
-        return ("E", "CPU E-cluster")
-    if u.startswith("P"):
-        return ("P", "CPU P-cluster")
-    return ("?", "CPU other")
+    by_kind = {}
+    order = []
+    other = []
+    for e in cores:
+        kind, digits = _core_kind_and_digits(e.get("name"))
+        if kind is None:
+            other.append(e)
+            continue
+        if kind not in by_kind:
+            by_kind[kind] = []
+            order.append(kind)
+        by_kind[kind].append((digits, e))
+
+    clusters = {}
+    corder = []
+
+    def add(key, label, entry):
+        if key not in clusters:
+            clusters[key] = {"key": key, "label": label, "cores": []}
+            corder.append(key)
+        clusters[key]["cores"].append(entry)
+
+    for kind in order:
+        members = by_kind[kind]
+        letter = _KIND_LABELS.get(kind, kind)
+        # A leading cluster digit exists only when the name has >= 2 digits (one
+        # for the cluster, at least one for the core). Single-digit names are
+        # core indices within one cluster.
+        widths = {len(d) for d, _ in members}
+        indexed = len(widths) == 1 and widths.pop() >= 2
+        leading = {d[0] for d, _ in members}
+        if indexed and len(leading) > 1:
+            for digits, e in members:
+                idx = digits[0]
+                add(f"{letter}{idx}", f"CPU {letter}{idx}-cluster", e)
+        else:
+            for _, e in members:
+                add(letter, f"CPU {letter}-cluster", e)
+
+    for e in other:
+        add("?", "CPU other", e)
+
+    return [clusters[k] for k in corder]
 
 
 def organize(raw):
@@ -1099,23 +1170,13 @@ def organize(raw):
     # --- GPU: average across channels if there is more than one ---
     gpu_ch = raw.get("gpu", [])
     gpu_pct = (sum(e["active"] for e in gpu_ch) / len(gpu_ch) * 100) if gpu_ch else 0.0
-    gpu_mhz = cluster_freq_mhz(gpu_ch, match_ladder(_nsteps(gpu_ch), tables))
+    gpu_mhz = cluster_freq_mhz(gpu_ch, match_ladder(_nsteps(gpu_ch), tables, "absolute"))
 
     # --- CPU: group only the per-core (state residency) channels by cluster ---
     cores = [e for e in raw.get("cpu", []) if "COMPLEX" not in (e["subgroup"] or "").upper()]
 
-    clusters = {}   # key -> {"label", "cores"}
-    order = []
-    for e in cores:
-        key, label = cluster_type(e["name"])
-        if key not in clusters:
-            clusters[key] = {"key": key, "label": label, "cores": []}
-            order.append(key)
-        clusters[key]["cores"].append(e)
-
     out_clusters = []
-    for key in order:
-        c = clusters[key]
+    for c in group_clusters(cores):
         n = len(c["cores"])
         # Bind this cluster's ladder by its own P-state count, not by its name:
         # the voltage-states numbering differs per chip (see match_ladder).
