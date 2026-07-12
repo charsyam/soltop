@@ -9,7 +9,7 @@ import re
 import time
 from collections import deque
 
-__version__ = "0.5.4"
+__version__ = "0.5.5"
 
 from ctypes import (
     c_void_p,
@@ -937,6 +937,12 @@ CLEAR_TO_END = ESC + "0J"   # clear from cursor to end of screen (removes leftov
 HEADER = "\x1b[1;92m"       # bold green for section titles
 RESET = "\x1b[0m"
 
+# Rows in each history graph. Keep this EVEN: a row's value is (level+1)/height,
+# so a true 50% row -- the one vgraph() labels as the half-scale mark -- exists
+# only at even heights. At the previous height of 5 the rows sat at
+# 20/40/60/80/100 and there was no 50% row to label at all.
+GRAPH_HEIGHT = 6
+
 # 1/8-step blocks that fill from bottom to top
 EIGHTHS = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
 
@@ -976,12 +982,12 @@ def vgraph(history, height=8, width=48, label_max=None, label_unit="%",
             ch = EIGHTHS[fill]
             c = (color or color_for(vals[i])) if fill > 0 else ""
             cells.append(f"{c}{ch}\x1b[0m" if fill > 0 else ch)
-        # Label the top and middle rows. Testing `axis % label_step == 0` instead
-        # only ever labelled the top: at the height=5 both graphs actually use,
-        # the rows are 20/40/60/80/100 and only 100 divides by 50, so the midline
-        # label silently never appeared.
+        # Label the full-scale row and the half-scale row. Each row spans a band,
+        # and the row's top edge is (level+1)/height -- so a true 50% row exists
+        # only when height is even (at the old height=5 the rows sat at
+        # 20/40/60/80/100 and there was simply no 50% row to label).
         axis = (level + 1) / height * 100
-        if r == 0 or r == height // 2:
+        if r == 0 or abs(axis - 50) < 1e-9:
             if label_max is not None:
                 lab = f"{axis / 100 * label_max:.0f}{label_unit}"
             else:
@@ -1185,7 +1191,7 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
         stats = ""
     lines.append(f"{HEADER} GPU Usage: {cur:.1f}%{stats}  {freq_txt}{RESET}")
     if gpu_hist is not None:
-        lines.extend(vgraph(gpu_hist, height=5, width=max(10, width - 7)))
+        lines.extend(vgraph(gpu_hist, height=GRAPH_HEIGHT, width=max(10, width - 7)))
     lines.append("")
 
     # Power: cur/avg/peak table for components; total as an asitop-style gauge.
@@ -1212,7 +1218,7 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
         if soc_hist is not None:
             scale = 110.0
             norm = [min(100.0, (w / scale) * 100) for w in soc_hist]
-            lines.extend(vgraph(norm, height=5, width=max(10, width - 7),
+            lines.extend(vgraph(norm, height=GRAPH_HEIGHT, width=max(10, width - 7),
                                 label_max=scale, label_unit="W",
                                 color="\x1b[1;92m"))
         lines.append(f"  {comp}" + ("" if single_sample else "   (cur/avg/peak)"))

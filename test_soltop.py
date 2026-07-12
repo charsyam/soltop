@@ -182,23 +182,34 @@ def _core_view(n_e=4, n_p=10):
 
 
 class VGraphTests(unittest.TestCase):
-    def test_midline_label_is_drawn_at_the_height_actually_used(self):
-        # Both graphs render at height=5, whose axis rows are 20/40/60/80/100.
-        # The old `axis % label_step == 0` test (label_step=50) matched only 100,
-        # so the midline label never appeared in the real app.
-        rows = [soltop._ANSI_RE.sub("", r)
-                for r in soltop.vgraph([10, 50, 90], height=5, width=12)]
-        labelled = [r.split("│")[0].strip() for r in rows if "│" in r]
-        self.assertEqual(labelled[0], "100%")
-        self.assertIn("60%", labelled)
+    def _labels(self, **kw):
+        rows = [soltop._ANSI_RE.sub("", r) for r in soltop.vgraph(**kw)]
+        return [r.split("│")[0].strip() for r in rows if "│" in r]
 
-    def test_label_max_rescales_the_axis(self):
-        rows = [soltop._ANSI_RE.sub("", r)
-                for r in soltop.vgraph([50], height=5, width=8,
-                                       label_max=110.0, label_unit="W")]
-        labelled = [r.split("│")[0].strip() for r in rows if "│" in r]
-        self.assertEqual(labelled[0], "110W")
-        self.assertIn("66W", labelled)
+    def test_graph_height_is_even_so_a_true_50_percent_row_exists(self):
+        # A row's value is (level+1)/height, so only an even height puts a row
+        # exactly on 50%. At the old height of 5 the rows sat at 20/40/60/80/100
+        # and there was no halfway row to label.
+        self.assertEqual(soltop.GRAPH_HEIGHT % 2, 0)
+
+    def test_the_half_scale_row_is_labelled_50_percent(self):
+        labels = self._labels(history=[10, 50, 90], height=soltop.GRAPH_HEIGHT,
+                              width=12)
+        self.assertEqual(labels[0], "100%")
+        self.assertIn("50%", labels)
+
+    def test_label_max_rescales_the_axis_to_half_of_full_scale(self):
+        labels = self._labels(history=[50], height=soltop.GRAPH_HEIGHT, width=8,
+                              label_max=110.0, label_unit="W")
+        self.assertEqual(labels[0], "110W")
+        self.assertIn("55W", labels)      # half of the 110 W full scale
+
+    def test_an_odd_height_labels_no_halfway_row_rather_than_lying(self):
+        # There is no 50% row at height=5, so none is labelled -- the label must
+        # never be attached to a row that does not actually mean 50%.
+        labels = self._labels(history=[50], height=5, width=8)
+        self.assertEqual(labels[0], "100%")
+        self.assertNotIn("50%", labels)
 
 
 class GaugeStyleTests(unittest.TestCase):
@@ -387,7 +398,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.5.4")
+        self.assertEqual(soltop.__version__, "0.5.5")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200
