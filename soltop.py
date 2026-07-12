@@ -10,7 +10,7 @@ import subprocess
 import time
 from collections import deque
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 from ctypes import (
     c_void_p,
@@ -1240,7 +1240,7 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
     lines = []
 
     # Box title: app name + machine name + thermal/throttle state.
-    title = f"Soltop · {machine_name()}"
+    title = f"Soltop v{__version__} · {machine_name()}"
     ts = thermal_state()
     if ts >= 0:
         tcolor = {0: "\x1b[92m", 1: "\x1b[93m", 2: "\x1b[91m", 3: "\x1b[91m"}.get(ts, "")
@@ -1258,13 +1258,13 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
         return ("\x1b[K\n").join(wrap_box(lines, cols, title)) + "\x1b[K"
 
     if process_only:
-        title = "Soltop · GPU Processes · p: dashboard · q: quit"
+        title = f"Soltop v{__version__} · GPU Processes · p: dashboard · q: quit"
         limit = max(1, height - 4) if height else 10
         lines.extend(render_procs(procs or [], limit=limit))
         return _fit(lines, title)
 
     if core_only:
-        title = "Soltop · CPU Cores · c: dashboard · q: quit"
+        title = f"Soltop v{__version__} · CPU Cores · c: dashboard · q: quit"
         limit = max(1, height - 2) if height else None
         lines.extend(render_cores(view, width, limit=limit))
         return _fit(lines, title)

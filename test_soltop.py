@@ -594,7 +594,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.7.0")
+        self.assertEqual(soltop.__version__, "0.7.1")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200
