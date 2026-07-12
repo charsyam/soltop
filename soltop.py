@@ -9,7 +9,7 @@ import re
 import time
 from collections import deque
 
-__version__ = "0.5.3"
+__version__ = "0.5.4"
 
 from ctypes import (
     c_void_p,
@@ -192,25 +192,20 @@ _NOT_UTIL = ("CONTROLLER", "CLTM", "FENDER", "WARN", "DVD", "REASON CODE",
              "HISTOGRAM", "THROTTLER", "COMPLEX", "VOLTAGE")
 
 
-def _fallback_state_subgroups(all_ch):
-    """Rename-tolerant scan, used only when no canonical subgroup is present.
+def _fallback_state_subgroups(seen, kind):
+    """Rename-tolerant scan for one kind ('gpu'/'cpu'), from already-seen pairs.
 
     Keeps the original 'works even if Apple renames things' property, but
     excludes the status-register subgroups that are not utilization.
     """
-    wanted, seen = [], set()
-    for chan in iter_channels(all_ch):
-        group = from_cfstr(IOR.IOReportChannelGetGroup(chan))
-        subgroup = from_cfstr(IOR.IOReportChannelGetSubGroup(chan))
-        if not (classify_group(group) and subgroup):
+    wanted = []
+    for group, subgroup in seen:
+        if classify_group(group) != kind:
             continue
         u = subgroup.upper()
         if "PERFORMANCE STATE" not in u or any(b in u for b in _NOT_UTIL):
             continue
-        pair = (group, subgroup)
-        if pair not in seen:
-            seen.add(pair)
-            wanted.append(pair)
+        wanted.append((group, subgroup))
     return wanted
 
 
@@ -237,15 +232,17 @@ def discover_state_channels():
         pair = (group, subgroup)
         if classify_group(group) and subgroup and pair not in seen:
             seen.append(pair)
-
-    for kind, names in _UTIL_SUBGROUPS.items():
-        for group, subgroup in seen:
-            if classify_group(group) == kind and subgroup in names:
-                available.append((group, subgroup))
-
-    if not available:
-        available = _fallback_state_subgroups(all_ch)
     CF.CFRelease(all_ch)
+
+    # Fall back PER KIND, not globally: if only one of the two canonical names is
+    # renamed, a global "is `available` empty?" check would find the surviving one,
+    # skip the fallback entirely, and drop that whole subsystem from the display.
+    for kind, names in _UTIL_SUBGROUPS.items():
+        found = [(g, sg) for g, sg in seen
+                 if classify_group(g) == kind and sg in names]
+        if not found:
+            found = _fallback_state_subgroups(seen, kind)
+        available.extend(found)
 
     if not available:
         raise RuntimeError("no GPU/CPU state channels found")
@@ -955,14 +952,13 @@ def color_for(pct):
     return "\x1b[1;92m"      # green
 
 
-def vgraph(history, height=8, width=48, label_step=50, label_max=None, label_unit="%",
+def vgraph(history, height=8, width=48, label_max=None, label_unit="%",
            color=None):
     """Draw history(%) as a vertical bar graph that grows from bottom to top.
 
     Oldest value on the left, newest on the right; column height is utilization.
-    Only y-axis rows whose value is a multiple of label_step are labelled.
-    If label_max is given, axis labels show that scale (e.g. watts) instead of %,
-    where the top of the graph == label_max.
+    The top and middle rows carry a y-axis label. If label_max is given, those
+    labels show that scale (e.g. watts) instead of %, with the top == label_max.
     """
     vals = list(history)[-width:]
     vals = [0.0] * (width - len(vals)) + vals  # pad the left with empty values
@@ -980,13 +976,16 @@ def vgraph(history, height=8, width=48, label_step=50, label_max=None, label_uni
             ch = EIGHTHS[fill]
             c = (color or color_for(vals[i])) if fill > 0 else ""
             cells.append(f"{c}{ch}\x1b[0m" if fill > 0 else ch)
-        # y-axis label only at multiples of label_step (e.g. 50%), else blank
-        axis = int(round((level + 1) / height * 100))
-        if label_step and axis % label_step == 0:
+        # Label the top and middle rows. Testing `axis % label_step == 0` instead
+        # only ever labelled the top: at the height=5 both graphs actually use,
+        # the rows are 20/40/60/80/100 and only 100 divides by 50, so the midline
+        # label silently never appeared.
+        axis = (level + 1) / height * 100
+        if r == 0 or r == height // 2:
             if label_max is not None:
-                lab = f"{(axis / 100) * label_max:.0f}{label_unit}"
+                lab = f"{axis / 100 * label_max:.0f}{label_unit}"
             else:
-                lab = f"{axis}{label_unit}"
+                lab = f"{axis:.0f}{label_unit}"
         else:
             lab = ""
         rows.append(f"  {lab:>4}│{''.join(cells)}")

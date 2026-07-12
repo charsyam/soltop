@@ -132,9 +132,38 @@ class ChannelSelectionTests(unittest.TestCase):
 
     def test_fallback_scan_still_accepts_a_renamed_core_subgroup(self):
         # A rename must degrade gracefully, not select nothing.
-        u = "GPU Core Performance States".upper()
-        self.assertTrue("PERFORMANCE STATE" in u
-                        and not any(b in u for b in soltop._NOT_UTIL))
+        for renamed in ("GPU Cluster Performance States",
+                        "CPU Cluster Performance States",
+                        "ECPU Performance States"):
+            self.assertTrue(
+                soltop._fallback_state_subgroups(
+                    [("GPU Stats" if renamed.startswith("GPU") else "CPU Stats",
+                      renamed)],
+                    "gpu" if renamed.startswith("GPU") else "cpu"),
+                renamed)
+
+    def test_fallback_still_rejects_aggregates_and_status_registers(self):
+        seen = [("CPU Stats", "CPU Complex Performance States"),
+                ("GPU Stats", "GPU Boost Controller Performance States"),
+                ("GPU Stats", "Fender State")]
+        self.assertEqual(soltop._fallback_state_subgroups(seen, "cpu"), [])
+        self.assertEqual(soltop._fallback_state_subgroups(seen, "gpu"), [])
+
+    def test_fallback_is_per_kind_not_all_or_nothing(self):
+        # If only ONE canonical name is renamed, a global "is anything found?"
+        # check would see the surviving one, skip the fallback, and drop that
+        # whole subsystem (CPU or GPU) from the display entirely.
+        seen = [("GPU Stats", "GPU Performance States"),          # canonical
+                ("CPU Stats", "CPU Cluster Performance States")]  # renamed
+        available = []
+        for kind, names in soltop._UTIL_SUBGROUPS.items():
+            found = [(g, sg) for g, sg in seen
+                     if soltop.classify_group(g) == kind and sg in names]
+            if not found:
+                found = soltop._fallback_state_subgroups(seen, kind)
+            available.extend(found)
+        kinds = {soltop.classify_group(g) for g, _ in available}
+        self.assertEqual(kinds, {"gpu", "cpu"}, available)
 
 
 def _core_view(n_e=4, n_p=10):
@@ -150,6 +179,26 @@ def _core_view(n_e=4, n_p=10):
              "mhz": 70.0, "freq_unit": "%", "per_core": cores("PCPU", n_p)},
         ],
     }
+
+
+class VGraphTests(unittest.TestCase):
+    def test_midline_label_is_drawn_at_the_height_actually_used(self):
+        # Both graphs render at height=5, whose axis rows are 20/40/60/80/100.
+        # The old `axis % label_step == 0` test (label_step=50) matched only 100,
+        # so the midline label never appeared in the real app.
+        rows = [soltop._ANSI_RE.sub("", r)
+                for r in soltop.vgraph([10, 50, 90], height=5, width=12)]
+        labelled = [r.split("│")[0].strip() for r in rows if "│" in r]
+        self.assertEqual(labelled[0], "100%")
+        self.assertIn("60%", labelled)
+
+    def test_label_max_rescales_the_axis(self):
+        rows = [soltop._ANSI_RE.sub("", r)
+                for r in soltop.vgraph([50], height=5, width=8,
+                                       label_max=110.0, label_unit="W")]
+        labelled = [r.split("│")[0].strip() for r in rows if "│" in r]
+        self.assertEqual(labelled[0], "110W")
+        self.assertIn("66W", labelled)
 
 
 class GaugeStyleTests(unittest.TestCase):
@@ -338,7 +387,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.5.3")
+        self.assertEqual(soltop.__version__, "0.5.4")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200
