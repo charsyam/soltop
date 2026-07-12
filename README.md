@@ -1,6 +1,6 @@
 # soltop
 
-Current version: **0.6.3**
+Current version: **0.7.0**
 
 An Apple Silicon GPU / CPU / power monitor for the terminal — like `asitop`,
 but **without `sudo` and without `powermetrics`**.
@@ -15,7 +15,7 @@ user privileges.
   IORegistry accounting — no sudo. Shows GPU ms/s and GPU%, plus each process's
   CPU% and memory.
 - **Power**: CPU / GPU / ANE / DRAM / Total (cur / avg / peak) + history graph
-- **CPU** E/P clusters: usage + DVFS level, with core counts (press `c` for a
+- **CPU** E/P clusters: usage + frequency, with core counts (press `c` for a
   per-core breakdown)
 - **Memory**: used / wired / compressed / swap
 - **Thermal / throttle** state
@@ -60,17 +60,14 @@ Pressing the same key again returns to the dashboard.
   unified, so that *is* the memory it costs the SoC — the GPU driver publishes
   no separate VRAM figure (per GPU client it exposes only the API, the
   accumulated GPU time, and the last submission time).
-- **GPU frequency is exact MHz.** CPU clusters are reported as a *DVFS level*
-  (`@ 62% DVFS`) rather than MHz: the CPU `voltage-states` table uses a raw unit
-  with no documented MHz conversion, and it varies by generation. Earlier
-  versions normalized it against a hardcoded per-cluster maximum, which produced
-  confidently wrong clock numbers on any chip that didn't match. A percentage of
-  the cluster's own top DVFS step is what the data actually supports.
-- The reported clock is the **mean over the sampling interval**, with idle
-  residency counted at the bottom of the ladder — the same thing `powermetrics`
-  reports. It is not "the clock while a core happens to be awake", which on
-  Apple Silicon is almost always the top step (a core runs flat out, then drops
-  straight to idle) and so would sit near 100% even on an idle machine.
+- **Frequencies are exact MHz**, for GPU and CPU alike. The GPU's
+  `voltage-states` table holds plain Hz; the CPU's holds the *period* of each
+  step, so `MHz = 65532288 / raw`. Verified against
+  `sudo powermetrics --samplers cpu_power`: every step of both CPU ladders it
+  prints is reproduced exactly.
+- The reported clock is the **active-residency-weighted** one — `powermetrics`'
+  "HW active frequency", i.e. the clock a core runs at while it is actually
+  running, with idle excluded.
 
 ## License
 

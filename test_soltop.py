@@ -263,14 +263,14 @@ class ChannelSelectionTests(unittest.TestCase):
 def _core_view(n_e=4, n_p=10):
     def cores(prefix, n):
         return [{"name": f"{prefix}{i:03d}", "pct": 10.0 * i, "mhz": 50.0,
-                 "freq_unit": "%"} for i in range(n)]
+                 } for i in range(n)]
     return {
         "gpu_pct": 0.0,
         "clusters": [
             {"key": "E", "label": "CPU E-cluster", "avg": 20.0, "count": n_e,
-             "mhz": 60.0, "freq_unit": "%", "per_core": cores("ECPU", n_e)},
+             "mhz": 60.0, "per_core": cores("ECPU", n_e)},
             {"key": "P", "label": "CPU P-cluster", "avg": 30.0, "count": n_p,
-             "mhz": 70.0, "freq_unit": "%", "per_core": cores("PCPU", n_p)},
+             "mhz": 70.0, "per_core": cores("PCPU", n_p)},
         ],
     }
 
@@ -336,10 +336,10 @@ class CoreViewTests(unittest.TestCase):
         # The dashboard's cluster gauges must not appear in this view.
         self.assertNotIn("GPU Usage:", frame)
 
-    def test_per_core_percent_and_dvfs_are_not_truncated_away(self):
+    def test_per_core_percent_and_freq_are_not_truncated_away(self):
         # The bar must leave room for the value columns, or wrap_box() clips them.
         frame = soltop.render(_core_view(), cols=90, procs=[], core_only=True)
-        self.assertIn("% DVFS", frame)
+        self.assertIn("MHz", frame)
         self.assertIn("30.00%", frame)   # ECPU003 -> pct 30.0
 
     def test_core_view_fits_the_frame_and_keeps_the_box_intact(self):
@@ -526,20 +526,40 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop.active_ratio({}), 0.0)
         self.assertIsNone(soltop.active_ratio({"P0": 10, "P1": 20}))
 
-    def test_cluster_frequency_weights_idle_at_the_bottom_of_the_ladder(self):
-        # Idle residency counts at the ladder floor, so the reported clock is the
-        # mean over the interval, not "the clock while awake" (which on Apple
-        # Silicon is ~always the top step and pinned the display near 100%).
+    def test_cluster_frequency_excludes_idle_residency(self):
+        # This is powermetrics' "HW active frequency": the clock while a core is
+        # actually running. Verified against `sudo powermetrics` -- for an
+        # E-cluster at 73.21% active residency it prints 1920 MHz, which only the
+        # active-weighted mean reproduces (folding idle in at the ladder floor
+        # gives 1678 MHz).
         ladder = [1000, 2000, 3000]
-        # 100 idle @1000 + 20 @2000 + 20 @3000 -> (100000+40000+60000)/140
         cores = [{"states": {"IDLE": 100, "V1P1": 20, "V2P0": 20}}]
-        self.assertAlmostEqual(soltop.cluster_freq_mhz(cores, ladder), 200000 / 140)
-        # A fully parked cluster sits at the bottom of the ladder.
+        self.assertAlmostEqual(soltop.cluster_freq_mhz(cores, ladder), 2500)
+        # A fully parked cluster has no active residency to report.
         parked = [{"states": {"IDLE": 100, "DOWN": 50}}]
-        self.assertEqual(soltop.cluster_freq_mhz(parked, ladder), 1000)
+        self.assertEqual(soltop.cluster_freq_mhz(parked, ladder), 0.0)
         # A fully pegged cluster sits at the top.
         pegged = [{"states": {"V2P0": 100}}]
         self.assertEqual(soltop.cluster_freq_mhz(pegged, ladder), 3000)
+
+    def test_cpu_ladder_matches_powermetrics(self):
+        # The CPU voltage-states table holds the PERIOD of each step, so
+        # MHz = CPU_PERIOD_NUMERATOR / raw. These raw values are this M4 Pro's,
+        # and the results are the exact ladders `sudo powermetrics` prints.
+        e_raw = [64250, 46678, 36653, 31030, 27863, 25883, 25283]
+        p_raw = [52012, 43343, 36408, 31386, 27863, 25051, 22850, 21167, 19859,
+                 18897, 18083, 17448, 17013, 16701, 16400, 16205, 15968, 14840,
+                 14524]
+
+        def to_mhz(raws):
+            return sorted(round(soltop.CPU_PERIOD_NUMERATOR / r) for r in raws)
+
+        self.assertEqual(to_mhz(e_raw),
+                         [1020, 1404, 1788, 2112, 2352, 2532, 2592])
+        self.assertEqual(to_mhz(p_raw),
+                         [1260, 1512, 1800, 2088, 2352, 2616, 2868, 3096, 3300,
+                          3468, 3624, 3756, 3852, 3924, 3996, 4044, 4104, 4416,
+                          4512])
 
     def test_pstate_index_reads_the_ascending_v_field(self):
         # CPU names are V<v>P<p> with v ascending and p descending, so
@@ -563,22 +583,18 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop.cluster_freq_mhz(top, ladder), 3000)
         self.assertEqual(soltop.cluster_freq_mhz(bottom, ladder), 1000)
 
-    def test_cluster_freq_reports_table_unit(self):
+    def test_cluster_freq_reads_the_ladder_by_index(self):
         cores = [{"states": {"V1P1": 10}}]      # V=1 -> ladder index 1
-        mhz = {"values": [1000, 2000, 3000], "unit": "MHz"}
-        self.assertEqual(soltop.cluster_freq(cores, mhz), (2000, "MHz"))
-        # A scale-less CPU ladder must be reported as a percentage, never as MHz.
-        pct = {"values": [50.0, 100.0], "unit": "%"}
-        self.assertEqual(soltop.cluster_freq(cores, pct), (100.0, "%"))
-        self.assertEqual(soltop.cluster_freq(cores, []), (0.0, "MHz"))
+        table = {"values": [1000, 2000, 3000], "unit": "MHz"}
+        self.assertEqual(soltop.cluster_freq_mhz(cores, table), 2000)
+        self.assertEqual(soltop.cluster_freq_mhz(cores, []), 0.0)
 
-    def test_freq_txt_never_invents_mhz_for_a_scaleless_ladder(self):
-        self.assertEqual(soltop._freq_txt(1398.0, "MHz"), "@ 1398 MHz")
-        self.assertEqual(soltop._freq_txt(62.0, "%"), "@ 62% DVFS")
-        self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
+    def test_freq_txt(self):
+        self.assertEqual(soltop._freq_txt(1398.0), "@ 1398 MHz")
+        self.assertEqual(soltop._freq_txt(0.0), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.6.3")
+        self.assertEqual(soltop.__version__, "0.7.0")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200

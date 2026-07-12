@@ -10,7 +10,7 @@ import subprocess
 import time
 from collections import deque
 
-__version__ = "0.6.3"
+__version__ = "0.7.0"
 
 from ctypes import (
     c_void_p,
@@ -286,13 +286,23 @@ POWER_LABELS = ("CPU", "GPU", "ANE", "DRAM")
 
 
 # --- DVFS frequency tables (voltage-states in IORegistry, no sudo) -----------
-# Only the GPU table is stored in a unit we can convert exactly (Hz -> MHz).
-# The CPU tables use a raw unit whose absolute scale is undocumented and varies
-# by generation, so we do NOT invent an MHz number for them -- a wrong-but-precise
-# "@ 3891 MHz" is worse than no number. Instead the CPU ladder is reported as a
-# 0..100 position ("DVFS %"), which is exactly what the raw table supports.
+# The GPU table holds plain Hz. The CPU tables hold the *period* of each step,
+# not its frequency, which is why they descend while the GPU's ascends:
+#
+#     MHz = CPU_PERIOD_NUMERATOR / raw
+#
+# Verified against `sudo powermetrics --samplers cpu_power` on an M4 Pro: every
+# step of both ladders it prints is reproduced exactly --
+#   E: 1020 1404 1788 2112 2352 2532 2592
+#   P: 1260 1512 1800 2088 2352 2616 2868 3096 3300 3468 3624 3756 3852 3924
+#      3996 4044 4104 4416 4512
+# The two clusters share one numerator, so this is not a per-cluster fudge
+# factor. (Earlier versions normalised the raw ladder against a hardcoded
+# per-cluster max instead, which produced confidently wrong clocks on any chip
+# that did not match; that is what this replaces.)
+CPU_PERIOD_NUMERATOR = 65_532_288
 _VOLTAGE_STATE_KEYS = {"E": "voltage-states1", "P": "voltage-states5", "GPU": "voltage-states9"}
-# Tables whose values are true frequencies and can be shown in MHz.
+# Tables stored as Hz rather than as a period.
 _ABSOLUTE_FREQ_CLUSTERS = ("GPU",)
 
 
@@ -341,10 +351,10 @@ def _read_u32_data(keynames):
 
 
 def load_dvfs():
-    """Return {cluster: {"values": [ascending], "unit": "MHz"|"%"}} best-effort.
+    """Return {cluster: {"values": [ascending MHz], "unit": "MHz"}} best-effort.
 
-    GPU values are true MHz. CPU ladders are reported as a percentage of the
-    cluster's own top step, because their raw unit has no known MHz conversion.
+    GPU values are stored as Hz; CPU values as the period of each step (see
+    CPU_PERIOD_NUMERATOR). Both come out as true MHz.
     """
     try:
         data = _read_u32_data(list(_VOLTAGE_STATE_KEYS.values()))
@@ -355,14 +365,14 @@ def load_dvfs():
         raw = data.get(key)
         if not raw:
             continue
-        freqs = [f for f in raw[0::2] if f]     # first uint of each (freq, volt) pair
-        if not freqs:
+        vals = [f for f in raw[0::2] if f]      # first uint of each (freq, volt) pair
+        if not vals:
             continue
-        if cluster in _ABSOLUTE_FREQ_CLUSTERS and max(freqs) > 1_000_000:
-            tables[cluster] = {"values": sorted(f / 1e6 for f in freqs), "unit": "MHz"}
+        if cluster in _ABSOLUTE_FREQ_CLUSTERS and max(vals) > 1_000_000:
+            mhz = [v / 1e6 for v in vals]                       # Hz -> MHz
         else:
-            hi = max(freqs)
-            tables[cluster] = {"values": sorted(f / hi * 100 for f in freqs), "unit": "%"}
+            mhz = [CPU_PERIOD_NUMERATOR / v for v in vals]      # period -> MHz
+        tables[cluster] = {"values": sorted(mhz), "unit": "MHz"}
     return tables
 
 
@@ -396,19 +406,18 @@ def _pstate_index(name):
 
 
 def cluster_freq_mhz(cores, table):
-    """Mean DVFS level over the interval, weighted by ALL residency.
+    """Active-residency-weighted clock, i.e. powermetrics' "HW active frequency".
 
-    Idle residency counts at the bottom of the ladder, because a parked core is
-    not clocking. Averaging only the active states instead answers "how fast is
-    a core when it happens to be awake", which on Apple Silicon is ~always the
-    top step (a core runs flat out, then drops straight to IDLE) -- that pinned
-    the display near 100% even on an idle machine and carried no information.
-    Weighting all residency gives the mean clock over the interval, which is
-    what powermetrics reports and what actually tracks load.
+    Idle residency is EXCLUDED, not counted at the bottom of the ladder. Checked
+    against `sudo powermetrics` on an M4 Pro: for an E-cluster at 73.21% active
+    residency it prints "HW active frequency: 1920 MHz", and weighting only the
+    active states reproduces that (1916 MHz), while folding idle in at the ladder
+    floor gives 1678 MHz. So this is the number powermetrics means -- the clock a
+    core runs at while it is actually running, not the mean over wall time.
 
     ``table`` is either a plain ascending list of values or the {"values","unit"}
     dict produced by load_dvfs(). Returns the weighted value (0.0 if unknown);
-    use cluster_freq(), which also reports the unit, for display.
+    Returns MHz, or 0.0 when the ladder or the residency is unknown.
     """
     values = table.get("values") if isinstance(table, dict) else table
     if not values:
@@ -416,24 +425,15 @@ def cluster_freq_mhz(cores, table):
     num = den = 0.0
     for core in cores:
         for name, res in core.get("states", {}).items():
-            if res <= 0:
+            if res <= 0 or is_idle_state(name):
                 continue
-            if is_idle_state(name):
-                idx = 0                     # parked -> bottom of the ladder
-            else:
-                idx = _pstate_index(name)
-                if idx is None:
-                    continue
-                idx = max(0, min(len(values) - 1, idx))
+            idx = _pstate_index(name)
+            if idx is None:
+                continue
+            idx = max(0, min(len(values) - 1, idx))
             num += res * values[idx]
             den += res
     return (num / den) if den > 0 else 0.0
-
-
-def cluster_freq(cores, table):
-    """As cluster_freq_mhz(), but also returns the unit -> (value, unit)."""
-    unit = table.get("unit", "MHz") if isinstance(table, dict) else "MHz"
-    return cluster_freq_mhz(cores, table), unit
 
 
 # Populated lazily on first Sampler (needs IOKIT, defined further below).
@@ -726,19 +726,13 @@ def _gpu_client_totals():
     return totals
 
 
-# How many of the top rows get a cpu/memory lookup. render_procs() only ever
-# shows a screenful, so there is no point costing rows past this -- and since
-# idle GPU clients are listed too, a frame carries ~70 of them.
-PROC_STATS_LIMIT = 30
-
-
 def _attach_proc_stats(rows):
     """Fill in each row's cpu_pct and rss_bytes, in one `ps` call for all pids.
 
-    The GPU driver publishes only API / accumulatedGPUTime / lastSubmittedTime
-    per client -- no memory figure -- so CPU and memory come from the process
-    itself. On Apple Silicon memory is unified, so a process's RSS *is* the
-    memory it is costing the SoC; there is no separate VRAM number to report.
+    The GPU driver publishes only the API name and the accumulated GPU time per
+    client -- no memory figure -- so CPU and memory come from the process itself.
+    On Apple Silicon memory is unified, so a process's RSS *is* the memory it is
+    costing the SoC; there is no separate VRAM number to report.
 
     This shells out rather than calling proc_pid_rusage() via ctypes, which would
     be ~2700x cheaper per pid, because rusage is readable only for processes the
@@ -825,9 +819,7 @@ class ProcGPUSampler:
         self.prev_time = now
         self.started = True
         rows.sort(key=lambda r: r["gpu_ms_s"], reverse=True)
-        # Sort first, then look up cpu/memory only for rows a caller could
-        # plausibly display.
-        _attach_proc_stats(rows[:PROC_STATS_LIMIT])
+        _attach_proc_stats(rows)
         return rows
 
 
@@ -990,7 +982,7 @@ def organize(raw):
     # --- GPU: average across channels if there is more than one ---
     gpu_ch = raw.get("gpu", [])
     gpu_pct = (sum(e["active"] for e in gpu_ch) / len(gpu_ch) * 100) if gpu_ch else 0.0
-    gpu_mhz, gpu_unit = cluster_freq(gpu_ch, tables.get("GPU", []))
+    gpu_mhz = cluster_freq_mhz(gpu_ch, tables.get("GPU", []))
 
     # --- CPU: group only the per-core (state residency) channels by cluster ---
     cores = [e for e in raw.get("cpu", []) if "COMPLEX" not in (e["subgroup"] or "").upper()]
@@ -1010,19 +1002,17 @@ def organize(raw):
         n = len(c["cores"])
         table = tables.get(key, [])
         avg = sum(x["active"] for x in c["cores"]) / n * 100
-        mhz, unit = cluster_freq(c["cores"], table)
+        mhz = cluster_freq_mhz(c["cores"], table)
         # Per-core figures for the 'c' (per-core) view. Computed here rather than
         # in render() so the DVFS tables stay out of the display layer.
         per_core = []
         for x in c["cores"]:
-            cf, cu = cluster_freq([x], table)
             per_core.append({"name": x["name"], "pct": x["active"] * 100,
-                             "mhz": cf, "freq_unit": cu})
+                             "mhz": cluster_freq_mhz([x], table)})
         out_clusters.append({**c, "avg": avg, "count": n, "mhz": mhz,
-                             "freq_unit": unit, "per_core": per_core})
+                             "per_core": per_core})
 
     return {"gpu_pct": gpu_pct, "gpu_channels": gpu_ch, "gpu_mhz": gpu_mhz,
-            "gpu_freq_unit": gpu_unit,
             "clusters": out_clusters,
             "power": raw.get("power", {}),
             "power_avg": raw.get("power_avg", {}), "power_peak": raw.get("power_peak", {})}
@@ -1198,13 +1188,11 @@ def wrap_box(lines, cols, title=""):
     return out
 
 
-def _freq_txt(value, unit):
-    """'@ 1398 MHz' for a true clock, '@ 62% DVFS' for a scale-less ladder."""
-    if not value:
+def _freq_txt(mhz):
+    """'@ 1398 MHz', or nothing when the clock is unknown."""
+    if not mhz:
         return ""
-    if unit == "MHz":
-        return f"@ {value:.0f} MHz"
-    return f"@ {value:.0f}% DVFS"
+    return f"@ {mhz:.0f} MHz"
 
 
 def render_cores(view, width, limit=None):
@@ -1223,13 +1211,13 @@ def render_cores(view, width, limit=None):
     for c in view.get("clusters", []):
         if limit is not None and len(lines) >= limit:
             break
-        ftxt = _freq_txt(c.get("mhz", 0.0), c.get("freq_unit", "MHz"))
+        ftxt = _freq_txt(c.get("mhz", 0.0))
         head = f"{HEADER} {c['label']}  ({c['count']} cores)  avg {c['avg']:.1f}%"
         lines.append(head + (f"  {ftxt}" if ftxt else "") + RESET)
         for core in c.get("per_core", []):
             if limit is not None and len(lines) >= limit:
                 break
-            cf = _freq_txt(core.get("mhz", 0.0), core.get("freq_unit", "MHz"))
+            cf = _freq_txt(core.get("mhz", 0.0))
             pct = core["pct"]
             lines.append("  %-8s %s %6.2f%%  %s"
                          % (core["name"], bracket_gauge(pct / 100, bw), pct, cf))
@@ -1283,7 +1271,7 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
 
     title += "   p: processes   c: cores   q: quit"
 
-    freq_txt = _freq_txt(view.get("gpu_mhz", 0.0), view.get("gpu_freq_unit", "MHz"))
+    freq_txt = _freq_txt(view.get("gpu_mhz", 0.0))
     cur = view["gpu_pct"]
     if single_sample:
         stats = ""
@@ -1345,7 +1333,7 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
     counts = "  ".join(f"{c['key']}:{c['count']}" for c in view["clusters"])
     lines.append(f"{HEADER} CPU  ({counts}){RESET}")
     for c in view["clusters"]:
-        ftxt = _freq_txt(c.get("mhz", 0.0), c.get("freq_unit", "MHz"))
+        ftxt = _freq_txt(c.get("mhz", 0.0))
         val = f"{c['avg']:.1f}%" + (f"  {ftxt}" if ftxt else "")
         lines.extend(hgauge(c["label"], c["avg"] / 100, width, val))
     lines.append("")
