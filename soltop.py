@@ -8,7 +8,7 @@ import ctypes.util
 import time
 from collections import deque
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 from ctypes import (
     c_void_p,
