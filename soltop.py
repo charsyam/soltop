@@ -1107,12 +1107,48 @@ def thermal_state():
 
 _CORE_RE = re.compile(r"^([A-Z]+)CPU(\d+)$")   # ECPU000 -> ('E','000'); MCPU14 -> ('M','14')
 
-# What a core's letter prefix means, for display only. The prefixes are NOT a
-# fixed vocabulary and must never gate which cores are kept: an M4 Pro reports
-# E/P, while an M5 Pro reports P (its 5 S-cores) and M (its 10 performance
-# cores) -- inverting what 'P' means between the two chips. Anything unlisted
-# still gets grouped and shown, just under its own letter.
-_KIND_LABELS = {"E": "E", "P": "P", "M": "P", "S": "S"}
+# A slower tier is an EFFICIENCY cluster only if it is much slower than the
+# fastest one. An M4 Pro's E-cluster tops out at 2592 MHz against the P's 4512
+# (57%), while an M5 Pro's two tiers are 4380 and 4608 (95%) -- both are
+# performance-class, the faster being Apple's "Super" cores. This ratio is what
+# tells "E below P" apart from "P below S"; the core-name letters cannot, since
+# 'PCPU' means Performance on an M4 and Super on an M5.
+_EFFICIENCY_MAX_RATIO = 0.75
+
+
+def _tier_labels(tiers):
+    """Name the CPU tiers from their ladder ceilings: {kind: 'E'|'P'|'S'}.
+
+    ``tiers`` maps a core-name kind ('E', 'P', 'M', ...) to that tier's top
+    ladder MHz. Ranking by ceiling rather than by letter is what makes the
+    labels agree with powermetrics on both chips:
+
+        M4 Pro   E 2592 / P 4512  -> the slow tier is 57% of the fast: E, P
+        M5 Pro   M 4380 / P 4608  -> the slow tier is 95% of the fast: P, S
+                                     (so M5's 'PCPU*' correctly reads as S)
+
+    A tier whose ladder is unknown (0) keeps its raw letter rather than being
+    guessed at. A single-tier chip is just 'P'.
+    """
+    known = {k: v for k, v in tiers.items() if v}
+    if not known:
+        return {k: k for k in tiers}
+    top = max(known.values())
+    labels = {}
+    for kind, ceiling in tiers.items():
+        if not ceiling:
+            labels[kind] = kind          # unknown ladder: do not invent a tier
+        elif ceiling == top:
+            # The fastest tier is 'S' only when a *performance*-class tier sits
+            # below it; if the tier below is an efficiency one, this is just P.
+            others = [v for k, v in known.items() if k != kind]
+            has_perf_below = any(v >= top * _EFFICIENCY_MAX_RATIO for v in others)
+            labels[kind] = "S" if has_perf_below else "P"
+        elif ceiling >= top * _EFFICIENCY_MAX_RATIO:
+            labels[kind] = "P"
+        else:
+            labels[kind] = "E"
+    return labels
 
 
 def _core_kind_and_digits(name):
@@ -1149,7 +1185,12 @@ def group_clusters(cores):
 
     Splitting on the leading digit regardless would turn the M5's five S-cores
     (PCPU0..PCPU4, five distinct leading digits) into five one-core clusters.
+
+    The E/P/S letter shown to the user is likewise not taken from the name -- it
+    is derived from each tier's ladder ceiling by _tier_labels, so that an M5's
+    'PCPU*' correctly reads as S (Super) rather than P.
     """
+    tables = DVFS or {}
     by_kind = {}
     order = []
     other = []
@@ -1163,6 +1204,13 @@ def group_clusters(cores):
             order.append(kind)
         by_kind[kind].append((digits, e))
 
+    # Each kind's ceiling = the top of the ladder its cores' P-state count binds.
+    ceilings = {}
+    for kind, members in by_kind.items():
+        ladder = match_cpu_ladder(_nsteps([e for _, e in members]), tables)
+        ceilings[kind] = ladder[-1] if ladder else 0.0
+    letters = _tier_labels(ceilings)
+
     clusters = {}
     corder = []
 
@@ -1174,7 +1222,7 @@ def group_clusters(cores):
 
     for kind in order:
         members = by_kind[kind]
-        letter = _KIND_LABELS.get(kind, kind)
+        letter = letters.get(kind, kind)
         # A leading cluster digit exists only when the name has >= 2 digits (one
         # for the cluster, at least one for the core). Single-digit names are
         # core indices within one cluster.

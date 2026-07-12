@@ -649,26 +649,56 @@ class SoltopLogicTests(unittest.TestCase):
         # performance cores. Hardcoding the letters (or splitting on the leading
         # digit regardless) turned PCPU0..PCPU4 into five one-core clusters and
         # dropped MCPU* into "CPU other".
-        def cores(names):
-            return [{"name": n, "active": 0.0, "states": {}} for n in names]
+        def cores(names, nsteps):
+            # Give each core a ladder-length-worth of P-states, so the tier can
+            # be ranked by its ceiling (see _tier_labels).
+            states = {"IDLE": 1}
+            states.update({f"V{i}P{nsteps - 1 - i}": 1 for i in range(nsteps)})
+            return [{"name": n, "active": 0.0, "states": dict(states)} for n in names]
 
-        # M5 Pro: 1-digit names are core indices within ONE cluster ...
-        m5 = soltop.group_clusters(cores(
-            [f"PCPU{i}" for i in range(5)] +
-            [f"MCPU{c}{i}" for c in (0, 1) for i in range(5)]))
-        self.assertEqual([(c["key"], len(c["cores"])) for c in m5],
-                         [("P", 5), ("P0", 5), ("P1", 5)])
+        saved = soltop.DVFS
+        try:
+            # M5 Pro: 1-digit names are core indices within ONE cluster, and the
+            # 20-step tier (4608 MHz) outranks the 15-step one (4380) -> S over P.
+            soltop.DVFS = {"voltage-states5": ("period", [1308.0] + [4608.0] * 19),
+                           "voltage-states22": ("period", [1344.0] + [4380.0] * 14)}
+            m5 = soltop.group_clusters(cores([f"PCPU{i}" for i in range(5)], 20) +
+                                       cores([f"MCPU{c}{i}" for c in (0, 1)
+                                              for i in range(5)], 15))
+            self.assertEqual([(c["key"], len(c["cores"])) for c in m5],
+                             [("S", 5), ("P0", 5), ("P1", 5)])
 
-        # ... while 2-3 digit names carry a leading CLUSTER index.
-        m4 = soltop.group_clusters(cores(
-            [f"ECPU0{i}0" for i in range(4)] +
-            [f"PCPU{c}{i}0" for c in (0, 1) for i in range(5)]))
-        self.assertEqual([(c["key"], len(c["cores"])) for c in m4],
-                         [("E", 4), ("P0", 5), ("P1", 5)])
+            # M4 Pro: 3-digit names carry a leading CLUSTER index, and the slow
+            # tier (2592) is far below the fast one (4512) -> a real E-cluster.
+            soltop.DVFS = {"voltage-states1": ("period", [1020.0] + [2592.0] * 6),
+                           "voltage-states5": ("period", [1260.0] + [4512.0] * 18)}
+            m4 = soltop.group_clusters(cores([f"ECPU0{i}0" for i in range(4)], 7) +
+                                       cores([f"PCPU{c}{i}0" for c in (0, 1)
+                                              for i in range(5)], 19))
+            self.assertEqual([(c["key"], len(c["cores"])) for c in m4],
+                             [("E", 4), ("P0", 5), ("P1", 5)])
 
-        # An unrecognised name is still shown, never dropped.
-        self.assertEqual([c["key"] for c in soltop.group_clusters(cores(["WEIRD"]))],
-                         ["?"])
+            # An unrecognised name is still shown, never dropped.
+            self.assertEqual(
+                [c["key"] for c in soltop.group_clusters(cores(["WEIRD"], 3))], ["?"])
+        finally:
+            soltop.DVFS = saved
+
+    def test_tier_labels_come_from_the_ladder_not_the_name(self):
+        # 'PCPU' means Performance on an M4 and Super on an M5, so the letter in
+        # the core name cannot name the tier. Rank by ladder ceiling instead.
+        #
+        # M4 Pro: the slow tier is 57% of the fast one -> an efficiency cluster.
+        self.assertEqual(soltop._tier_labels({"E": 2592.0, "P": 4512.0}),
+                         {"E": "E", "P": "P"})
+        # M5 Pro: the slow tier is 95% of the fast one -> both are performance
+        # class, so the faster one is Apple's "Super" cluster.
+        self.assertEqual(soltop._tier_labels({"P": 4608.0, "M": 4380.0}),
+                         {"P": "S", "M": "P"})
+        # A single tier is just P; an unknown ladder keeps its raw letter rather
+        # than having a tier invented for it.
+        self.assertEqual(soltop._tier_labels({"P": 4512.0}), {"P": "P"})
+        self.assertEqual(soltop._tier_labels({"X": 0.0}), {"X": "X"})
 
     def test_nsteps_counts_the_non_idle_states(self):
         # The ladder length is the number of non-idle P-states IOReport names.
@@ -711,9 +741,11 @@ class SoltopLogicTests(unittest.TestCase):
         finally:
             soltop.DVFS = saved
 
-        self.assertEqual(sorted(got), ["P", "P0", "P1"])
-        self.assertEqual(got["P"]["count"], 5)       # S-cluster: one cluster of 5
-        self.assertEqual(got["P"]["mhz"], 4608.0)    # 20-step ladder, top step
+        # The Super cluster is labelled S, not P, even though its cores are
+        # named PCPU* -- the tier comes from the ladder ceiling (4608 > 4380).
+        self.assertEqual(sorted(got), ["P0", "P1", "S"])
+        self.assertEqual(got["S"]["count"], 5)       # one cluster of 5
+        self.assertEqual(got["S"]["mhz"], 4608.0)    # 20-step ladder, top step
         self.assertEqual(got["P0"]["mhz"], 4380.0)   # 15-step ladder, top step
         # Parked: no active residency to weight, so no clock is claimed.
         self.assertEqual(got["P1"]["avg"], 0.0)
