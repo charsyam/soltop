@@ -1,6 +1,6 @@
 # soltop
 
-Current version: **0.3.0**
+Current version: **0.4.0**
 
 An Apple Silicon GPU / CPU / power monitor for the terminal — like `asitop`,
 but **without `sudo` and without `powermetrics`**.
@@ -14,7 +14,7 @@ user privileges.
 - **Per-process GPU usage** (like `nvidia-smi`), read from the driver's
   IORegistry accounting — no sudo
 - **Power**: CPU / GPU / ANE / DRAM / Total (cur / avg / peak) + history graph
-- **CPU** E/P clusters: usage + approximate frequency, with core counts
+- **CPU** E/P clusters: usage + DVFS level, with core counts
 - **Memory**: used / wired / compressed / swap
 - **Thermal / throttle** state
 - Auto-fits the terminal size, boxed asitop-style UI
@@ -28,14 +28,14 @@ brew install charsyam/tap/soltop
 ## Usage
 
 ```sh
-soltop              # live monitor (Ctrl-C to quit)
+soltop              # live monitor
 soltop -i 0.5       # sample every 0.5s
 soltop --once       # print one frame and exit
 soltop --version
 ```
 
 While running, press `p` to toggle between the dashboard and the full GPU
-process list. Press `Ctrl-C` to quit.
+process list. Press `q` (or `Ctrl-C`) to quit.
 
 ## Requirements
 
@@ -47,8 +47,12 @@ process list. Press `Ctrl-C` to quit.
 - No `sudo` and no `powermetrics` dependency.
 - GPU utilization and power come from IOReport residency / energy counters;
   they track trends well but are approximations, not firmware-exact values.
-- CPU cluster frequency is approximate (derived from DVFS residency; the CPU
-  voltage-states raw unit is normalized to a known max). GPU frequency is exact.
+- **GPU frequency is exact MHz.** CPU clusters are reported as a *DVFS level*
+  (`@ 62% DVFS`) rather than MHz: the CPU `voltage-states` table uses a raw unit
+  with no documented MHz conversion, and it varies by generation. Earlier
+  versions normalized it against a hardcoded per-cluster maximum, which produced
+  confidently wrong clock numbers on any chip that didn't match. A percentage of
+  the cluster's own top DVFS step is what the data actually supports.
 
 ## License
 

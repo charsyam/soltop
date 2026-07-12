@@ -6,8 +6,9 @@ Computes GPU/CPU active utilization from P-State residency on Apple Silicon.
 import ctypes
 import ctypes.util
 import time
+from collections import deque
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from ctypes import (
     c_void_p,
@@ -223,64 +224,83 @@ POWER_SCALE = {"CPU": 40000, "GPU": 40000, "ANE": 12000, "DRAM": 15000, "SoC": 8
 
 
 # --- DVFS frequency tables (voltage-states in IORegistry, no sudo) -----------
-# GPU table is stored in Hz (÷1e6 -> exact MHz). CPU tables use a different raw
-# unit whose absolute scale is unclear, so we keep the (valid) ladder shape and
-# normalize it to a known per-cluster max -> approximate but plausible MHz.
+# Only the GPU table is stored in a unit we can convert exactly (Hz -> MHz).
+# The CPU tables use a raw unit whose absolute scale is undocumented and varies
+# by generation, so we do NOT invent an MHz number for them -- a wrong-but-precise
+# "@ 3891 MHz" is worse than no number. Instead the CPU ladder is reported as a
+# 0..100 position ("DVFS %"), which is exactly what the raw table supports.
 _VOLTAGE_STATE_KEYS = {"E": "voltage-states1", "P": "voltage-states5", "GPU": "voltage-states9"}
-_ASSUMED_MAX_MHZ = {"E": 2592, "P": 4512}   # M-series efficiency / performance max
+# Tables whose values are true frequencies and can be shown in MHz.
+_ABSOLUTE_FREQ_CLUSTERS = ("GPU",)
 
 
-def _read_u32_data(keyname):
-    """Read an IORegistry CFData property as a list of little-endian uint32."""
+def _read_u32_data(keynames):
+    """Read IORegistry CFData properties as lists of little-endian uint32.
+
+    Takes several key names and returns {keyname: [uint32, ...]}, walking the
+    IOService plane only once -- the traversal is by far the expensive part, so
+    doing it per key would triple the startup cost for no benefit.
+    """
     CF.CFDataGetLength.restype = c_long
     CF.CFDataGetLength.argtypes = [c_void_p]
     CF.CFDataGetBytePtr.restype = c_void_p
     CF.CFDataGetBytePtr.argtypes = [c_void_p]
     it = c_uint32(0)
     if IOKIT.IORegistryCreateIterator(0, b"IOService", kIORegistryIterateRecursively, byref(it)) != 0:
-        return None
-    key = cfstr(keyname)
-    out = None
-    while True:
-        o = IOKIT.IOIteratorNext(it)
-        if not o:
-            break
-        props = c_void_p()
-        if IOKIT.IORegistryEntryCreateCFProperties(o, byref(props), None, 0) == 0 and props.value:
-            v = CF.CFDictionaryGetValue(props, key)
-            if v:
-                n = CF.CFDataGetLength(v)
-                p = CF.CFDataGetBytePtr(v)
-                out = list((c_uint32 * (n // 4)).from_address(p))
-            CF.CFRelease(props)
-        IOKIT.IOObjectRelease(o)
-        if out:
-            break
-    IOKIT.IOObjectRelease(it)
-    CF.CFRelease(key)
+        return {}
+    keys = {name: cfstr(name) for name in keynames}
+    out = {}
+    try:
+        while len(out) < len(keys):
+            o = IOKIT.IOIteratorNext(it)
+            if not o:
+                break
+            props = c_void_p()
+            if IOKIT.IORegistryEntryCreateCFProperties(o, byref(props), None, 0) == 0 and props.value:
+                for name, key in keys.items():
+                    if name in out:
+                        continue
+                    v = CF.CFDictionaryGetValue(props, key)
+                    if not v:
+                        continue
+                    n = CF.CFDataGetLength(v)
+                    if n >= 4:
+                        # from_address copies into a Python list before props is
+                        # released, so the CFData bytes need not outlive this call.
+                        out[name] = list((c_uint32 * (n // 4)).from_address(
+                            CF.CFDataGetBytePtr(v)))
+                CF.CFRelease(props)
+            IOKIT.IOObjectRelease(o)
+    finally:
+        IOKIT.IOObjectRelease(it)
+        for key in keys.values():
+            CF.CFRelease(key)
     return out
 
 
 def load_dvfs():
-    """Return {cluster: [mhz ascending]} for E / P / GPU, best-effort."""
+    """Return {cluster: {"values": [ascending], "unit": "MHz"|"%"}} best-effort.
+
+    GPU values are true MHz. CPU ladders are reported as a percentage of the
+    cluster's own top step, because their raw unit has no known MHz conversion.
+    """
+    try:
+        data = _read_u32_data(list(_VOLTAGE_STATE_KEYS.values()))
+    except Exception:
+        return {}
     tables = {}
     for cluster, key in _VOLTAGE_STATE_KEYS.items():
-        try:
-            raw = _read_u32_data(key)
-        except Exception:
-            raw = None
+        raw = data.get(key)
         if not raw:
             continue
         freqs = [f for f in raw[0::2] if f]     # first uint of each (freq, volt) pair
         if not freqs:
             continue
-        if max(freqs) > 1_000_000:              # stored in Hz -> exact MHz
-            mhz = sorted(f / 1e6 for f in freqs)
-        else:                                   # unknown unit -> normalize ladder shape
-            top = _ASSUMED_MAX_MHZ.get(cluster, max(freqs))
+        if cluster in _ABSOLUTE_FREQ_CLUSTERS and max(freqs) > 1_000_000:
+            tables[cluster] = {"values": sorted(f / 1e6 for f in freqs), "unit": "MHz"}
+        else:
             hi = max(freqs)
-            mhz = sorted(f / hi * top for f in freqs)
-        tables[cluster] = mhz
+            tables[cluster] = {"values": sorted(f / hi * 100 for f in freqs), "unit": "%"}
     return tables
 
 
@@ -296,8 +316,14 @@ def _pstate_index(name):
 
 
 def cluster_freq_mhz(cores, table):
-    """Residency-weighted active frequency (MHz) over a cluster's cores."""
-    if not table:
+    """Residency-weighted active DVFS level over a cluster's cores.
+
+    ``table`` is either a plain ascending list of values or the {"values","unit"}
+    dict produced by load_dvfs(). Returns the weighted value (0.0 if unknown);
+    use cluster_freq(), which also reports the unit, for display.
+    """
+    values = table.get("values") if isinstance(table, dict) else table
+    if not values:
         return 0.0
     num = den = 0.0
     for core in cores:
@@ -307,10 +333,16 @@ def cluster_freq_mhz(cores, table):
             idx = _pstate_index(name)
             if idx is None:
                 continue
-            idx = max(0, min(len(table) - 1, idx))
-            num += res * table[idx]
+            idx = max(0, min(len(values) - 1, idx))
+            num += res * values[idx]
             den += res
     return (num / den) if den > 0 else 0.0
+
+
+def cluster_freq(cores, table):
+    """As cluster_freq_mhz(), but also returns the unit -> (value, unit)."""
+    unit = table.get("unit", "MHz") if isinstance(table, dict) else "MHz"
+    return cluster_freq_mhz(cores, table), unit
 
 
 # Populated lazily on first Sampler (needs IOKIT, defined further below).
@@ -439,8 +471,12 @@ class Sampler:
 
             total = sum(states.values())
             ratio = active_ratio(states) if total > 0 else 0.0
-            # None (uncertain due to naming change) is treated as 0.
+            # None means the state names no longer look like anything we know, so
+            # utilization is untrustworthy -> report 0% AND drop the states, or the
+            # frequency would still be derived from them and show a busy clock at 0%.
             active = ratio if ratio is not None else 0.0
+            if ratio is None:
+                states, total = {}, 0
 
             self.last[key] = {
                 "name": name, "group": group, "subgroup": subgroup,
@@ -481,12 +517,6 @@ class Sampler:
         return {"gpu": gpu, "cpu": cpu,
                 "power": dict(self.power), "power_max": dict(self.power_max),
                 "power_avg": power_avg, "power_peak": dict(self.power_peak)}
-
-
-def sample(interval=1.0):
-    """Convenience helper that samples once and returns the result."""
-    with Sampler() as sampler:
-        return sampler.read(interval)
 
 
 # --- Per-process GPU usage (like nvidia-smi) ---------------------------------
@@ -605,26 +635,29 @@ class ProcGPUSampler:
     def step(self, interval=None):
         """Diff against the previous snapshot without sleeping (for live loop).
 
-        Uses monotonic time between snapshots. ``interval`` is retained for
-        backward compatibility and only used when no timestamp is available.
+        Elapsed time comes from the monotonic clock between snapshots. The first
+        call only establishes a baseline, so it always returns no rows.
+        ``interval`` is accepted and ignored; it is kept for callers that still
+        pass it.
         """
         snap = _gpu_client_totals()
         now = time.monotonic()
-        elapsed = now - self.prev_time if self.prev_time is not None else interval
+        elapsed = (now - self.prev_time) if self.prev_time is not None else 0.0
         rows = []
-        for pid, (name, ns2) in snap.items():
-            if pid in self.prev:
-                dns = ns2 - self.prev[pid][1]
-                if dns > 0 and elapsed and elapsed > 0:
-                    rows.append({"pid": pid, "name": name,
-                                 "gpu_ms_s": dns / 1e6 / elapsed})
+        if elapsed > 0:
+            for pid, (name, ns2) in snap.items():
+                if pid in self.prev:
+                    dns = ns2 - self.prev[pid][1]
+                    if dns > 0:
+                        rows.append({"pid": pid, "name": name,
+                                     "gpu_ms_s": dns / 1e6 / elapsed})
         self.prev = snap
         self.prev_time = now
         rows.sort(key=lambda r: r["gpu_ms_s"], reverse=True)
         return rows
 
 
-def render_procs(rows, limit=10, width=40):
+def render_procs(rows, limit=10):
     """Render a per-process GPU table (like nvidia-smi's process list)."""
     lines = [f"{HEADER} GPU processes (per-process GPU ms/s){RESET}"]
     if not rows:
@@ -761,7 +794,7 @@ def organize(raw):
     # --- GPU: average across channels if there is more than one ---
     gpu_ch = raw.get("gpu", [])
     gpu_pct = (sum(e["active"] for e in gpu_ch) / len(gpu_ch) * 100) if gpu_ch else 0.0
-    gpu_mhz = cluster_freq_mhz(gpu_ch, tables.get("GPU", []))
+    gpu_mhz, gpu_unit = cluster_freq(gpu_ch, tables.get("GPU", []))
 
     # --- CPU: group only the per-core (state residency) channels by cluster ---
     cores = [e for e in raw.get("cpu", []) if "COMPLEX" not in (e["subgroup"] or "").upper()]
@@ -780,18 +813,17 @@ def organize(raw):
         c = clusters[key]
         n = len(c["cores"])
         avg = sum(x["active"] for x in c["cores"]) / n * 100
-        mhz = cluster_freq_mhz(c["cores"], tables.get(key, []))
-        out_clusters.append({**c, "avg": avg, "count": n, "mhz": mhz})
+        mhz, unit = cluster_freq(c["cores"], tables.get(key, []))
+        out_clusters.append({**c, "avg": avg, "count": n, "mhz": mhz, "freq_unit": unit})
 
     return {"gpu_pct": gpu_pct, "gpu_channels": gpu_ch, "gpu_mhz": gpu_mhz,
+            "gpu_freq_unit": gpu_unit,
             "clusters": out_clusters,
             "power": raw.get("power", {}), "power_max": raw.get("power_max", {}),
             "power_avg": raw.get("power_avg", {}), "power_peak": raw.get("power_peak", {})}
 
 
 # --- Terminal display -------------------------------------------------------
-from collections import deque
-
 ESC = "\x1b["
 HIDE_CURSOR = ESC + "?25l"
 SHOW_CURSOR = ESC + "?25h"
@@ -912,32 +944,79 @@ def hgauge(label, frac, width, value=""):
 _ANSI_RE = None
 
 
-def _visible_len(s):
+def _ansi_re():
     import re
     global _ANSI_RE
     if _ANSI_RE is None:
         _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
-    return len(_ANSI_RE.sub("", s))
+    return _ANSI_RE
+
+
+def _visible_len(s):
+    return len(_ansi_re().sub("", s))
+
+
+def _truncate_visible(s, width):
+    """Cut s to `width` visible columns, keeping ANSI escapes intact.
+
+    Escape sequences cost no width, so they are copied through; a trailing RESET
+    is appended if anything was dropped, otherwise the color would bleed on.
+    """
+    if _visible_len(s) <= width:
+        return s
+    out, shown, pos = [], 0, 0
+    for m in _ansi_re().finditer(s):
+        for ch in s[pos:m.start()]:
+            if shown >= width:
+                return "".join(out) + RESET
+            out.append(ch)
+            shown += 1
+        out.append(m.group())
+        pos = m.end()
+    for ch in s[pos:]:
+        if shown >= width:
+            break
+        out.append(ch)
+        shown += 1
+    return "".join(out) + RESET
 
 
 def wrap_box(lines, cols, title=""):
-    """Wrap content lines in a full box border, title embedded in the top edge."""
+    """Wrap content lines in a full box border, title embedded in the top edge.
+
+    Content wider than the box is truncated so the right border never shifts.
+    """
     inner = max(4, cols - 2)
     t = f" {title} " if title else ""
     tv = _visible_len(t)
     if tv > inner:
-        t, tv = "", 0
+        t = _truncate_visible(t, inner)
+        tv = _visible_len(t)
     out = ["┌" + t + "─" * (inner - tv) + "┐"]
     for ln in lines:
+        ln = _truncate_visible(ln, inner)
         pad = inner - _visible_len(ln)
         out.append("│" + ln + " " * max(0, pad) + "│")
     out.append("└" + "─" * inner + "┘")
     return out
 
 
+def _freq_txt(value, unit):
+    """'@ 1398 MHz' for a true clock, '@ 62% DVFS' for a scale-less ladder."""
+    if not value:
+        return ""
+    if unit == "MHz":
+        return f"@ {value:.0f} MHz"
+    return f"@ {value:.0f}% DVFS"
+
+
 def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
-           process_only=False):
-    """Draw the organize() result (view). Does no data-structure reasoning."""
+           process_only=False, single_sample=False):
+    """Draw the organize() result (view). Does no data-structure reasoning.
+
+    ``single_sample`` suppresses the avg/peak columns, which carry no information
+    when only one sample has been taken (they would all just equal the current).
+    """
     width = bar_width_for(cols)
     lines = []
 
@@ -951,9 +1030,9 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
         title += f"   thermal: {tcolor}{tname}{thr}{RESET}"
 
     if process_only:
-        title = f"Soltop · GPU Processes · p: dashboard"
+        title = "Soltop · GPU Processes · p: dashboard · q: quit"
         limit = max(1, height - 4) if height else 10
-        lines.extend(render_procs(procs or [], limit=limit, width=width))
+        lines.extend(render_procs(procs or [], limit=limit))
         if height:
             content_height = max(0, height - 2)
             del lines[content_height:]
@@ -961,18 +1040,17 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
                 lines.append("")
         return ("\x1b[K\n").join(wrap_box(lines, cols, title)) + "\x1b[K"
 
-    title += "   p: processes"
+    title += "   p: processes   q: quit"
 
-    gpu_mhz = view.get("gpu_mhz", 0.0)
-    freq_txt = f"@ {gpu_mhz:.0f} MHz" if gpu_mhz else ""
+    freq_txt = _freq_txt(view.get("gpu_mhz", 0.0), view.get("gpu_freq_unit", "MHz"))
     cur = view["gpu_pct"]
-    if gpu_hist:
-        avg = sum(gpu_hist) / len(gpu_hist)
-        peak = max(gpu_hist)
+    if single_sample:
+        stats = ""
+    elif gpu_hist:
+        stats = f"  (avg {sum(gpu_hist) / len(gpu_hist):.1f}%  peak {max(gpu_hist):.1f}%)"
     else:
-        avg = peak = cur
-    lines.append(f"{HEADER} GPU Usage: {cur:.1f}%  (avg {avg:.1f}%  peak {peak:.1f}%)"
-                 f"  {freq_txt}{RESET}")
+        stats = ""
+    lines.append(f"{HEADER} GPU Usage: {cur:.1f}%{stats}  {freq_txt}{RESET}")
     if gpu_hist is not None:
         lines.extend(vgraph(gpu_hist, height=5, width=max(10, width - 7)))
     lines.append("")
@@ -985,14 +1063,18 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
     if power:
         # Components on one line, each with W unit and cur/avg/peak values.
         def triple(lbl):
+            if single_sample:
+                return f"{lbl} {power[lbl] / 1000:.1f}W"
             return (f"{lbl} {power[lbl] / 1000:.1f}/"
                     f"{pavg.get(lbl, 0) / 1000:.1f}/{ppeak.get(lbl, 0) / 1000:.1f}W")
         comp = " | ".join(triple(lbl) for lbl in ("CPU", "GPU", "ANE", "DRAM") if lbl in power)
         soc_w = power.get("SoC", 0) / 1000
-        avg_w = pavg.get("SoC", 0) / 1000
-        peak_w = ppeak.get("SoC", 0) / 1000
-        lines.append(f"{HEADER} Total Power: {soc_w:.1f}W"
-                     f"  (avg {avg_w:.1f}W  peak {peak_w:.1f}W){RESET}")
+        if single_sample:
+            pstats = ""
+        else:
+            pstats = (f"  (avg {pavg.get('SoC', 0) / 1000:.1f}W"
+                      f"  peak {ppeak.get('SoC', 0) / 1000:.1f}W)")
+        lines.append(f"{HEADER} Total Power: {soc_w:.1f}W{pstats}{RESET}")
         # Power history graph: fixed 110 W full-scale, always green (we don't
         # know the real per-machine limit, so don't imply thresholds by color).
         if soc_hist is not None:
@@ -1000,7 +1082,7 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
             norm = [min(100.0, (w / scale) * 100) for w in soc_hist]
             lines.extend(vgraph(norm, height=5, width=max(10, width - 7),
                                 label_max=scale, label_unit="W", color="\x1b[92m"))
-        lines.append(f"  {comp}   (cur/avg/peak)")
+        lines.append(f"  {comp}" + ("" if single_sample else "   (cur/avg/peak)"))
         lines.append("")
 
     # Memory: asitop-style gauge + text breakdown (wired / compressed / swap).
@@ -1022,8 +1104,8 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
     counts = "  ".join(f"{c['key']}:{c['count']}" for c in view["clusters"])
     lines.append(f"{HEADER} CPU  ({counts}){RESET}")
     for c in view["clusters"]:
-        mhz = c.get("mhz", 0.0)
-        val = f"{c['avg']:.1f}%" + (f"  @ {mhz:.0f} MHz" if mhz else "")
+        ftxt = _freq_txt(c.get("mhz", 0.0), c.get("freq_unit", "MHz"))
+        val = f"{c['avg']:.1f}%" + (f"  {ftxt}" if ftxt else "")
         lines.extend(hgauge(c["label"], c["avg"] / 100, width, val))
     lines.append("")
 
@@ -1034,7 +1116,7 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
         limit = max(1, height - len(lines) - 6)
     else:
         limit = 10
-    lines.extend(render_procs(procs or [], limit=limit, width=width))
+    lines.extend(render_procs(procs or [], limit=limit))
 
     if lines and lines[-1] == "":
         lines.pop()
@@ -1112,8 +1194,12 @@ def live(interval=1.0, cols_override=None):
                     procs = proc_sampler.step(interval)
                 except Exception:
                     procs = []
-                if keys.read_available().lower().count("p") % 2:
-                    process_only = not process_only
+                # Handle each key in order: every 'p' toggles, 'q'/ESC quits.
+                for k in keys.read_available().lower():
+                    if k == "p":
+                        process_only = not process_only
+                    elif k in ("q", "\x1b", "\x03"):
+                        return
                 tcols, rows = term_size()
                 cols = cols_override or tcols
                 # On resize, wipe the screen once so wrapped/old lines don't linger.
@@ -1166,15 +1252,14 @@ def main():
             except Exception:
                 proc_sampler = None
             view = organize(sampler.read(args.interval))
-            hist = deque([view["gpu_pct"]])
-            shist = deque([view.get("power", {}).get("SoC", 0) / 1000])
             try:
                 procs = proc_sampler.step() if proc_sampler else []
             except Exception:
                 procs = []
             tcols, rows = term_size()
-            print(render(view, cols_override or tcols, hist, procs,
-                         height=rows, soc_hist=shist))
+            # One sample: no history worth graphing, and no meaningful avg/peak.
+            print(render(view, cols_override or tcols, gpu_hist=None, procs=procs,
+                         height=rows, soc_hist=None, single_sample=True))
         finally:
             sampler.close()
     else:
