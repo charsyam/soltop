@@ -44,10 +44,11 @@ class LiveKeyTests(unittest.TestCase):
         real_render = soltop.render
 
         def spy(view, cols=80, gpu_hist=None, procs=None, height=None,
-                soc_hist=None, process_only=False, single_sample=False):
+                soc_hist=None, process_only=False, single_sample=False,
+                core_only=False):
             seen.append(process_only)
             return real_render(view, cols, gpu_hist, procs, height, soc_hist,
-                               process_only, single_sample)
+                               process_only, single_sample, core_only)
 
         with unittest.mock.patch.object(soltop, "Sampler", _FakeSampler), \
                 unittest.mock.patch.object(soltop, "ProcGPUSampler", _FakeProcSampler), \
@@ -70,6 +71,40 @@ class LiveKeyTests(unittest.TestCase):
         # The old count("p") % 2 logic silently swallowed an even number of
         # presses arriving in a single read; each press must toggle.
         self.assertEqual(self._run_live(["pp", "q"]), [False])
+
+    def _run_live_views(self, keys):
+        """Run live() against fakes, returning which view each frame drew."""
+        seen = []
+        real_render = soltop.render
+
+        def spy(view, cols=80, gpu_hist=None, procs=None, height=None,
+                soc_hist=None, process_only=False, single_sample=False,
+                core_only=False):
+            seen.append("proc" if process_only
+                        else "core" if core_only else "dash")
+            return real_render(view, cols, gpu_hist, procs, height, soc_hist,
+                               process_only, single_sample, core_only)
+
+        with unittest.mock.patch.object(soltop, "Sampler", _FakeSampler), \
+                unittest.mock.patch.object(soltop, "ProcGPUSampler", _FakeProcSampler), \
+                unittest.mock.patch.object(soltop, "KeyReader", lambda s: _FakeKeys(keys)), \
+                unittest.mock.patch.object(soltop.time, "sleep", lambda s: None), \
+                unittest.mock.patch.object(soltop, "render", spy), \
+                unittest.mock.patch("sys.stdout", new_callable=io.StringIO):
+            soltop.live(interval=0.01)
+        return seen
+
+    def test_c_toggles_the_per_core_view_and_back(self):
+        self.assertEqual(self._run_live_views(["", "c", "", "c", "", "q"]),
+                         ["dash", "core", "core", "dash", "dash"])
+
+    def test_core_and_process_views_are_mutually_exclusive(self):
+        # 'c' from the process view switches to cores rather than stacking, and
+        # 'p' from the core view switches back.
+        # Keys are handled before each frame is drawn, and 'q' returns without
+        # drawing, so four reads produce three frames.
+        self.assertEqual(self._run_live_views(["p", "c", "p", "q"]),
+                         ["proc", "core", "proc"])
 
 
 class ChannelSelectionTests(unittest.TestCase):
@@ -100,6 +135,51 @@ class ChannelSelectionTests(unittest.TestCase):
         u = "GPU Core Performance States".upper()
         self.assertTrue("PERFORMANCE STATE" in u
                         and not any(b in u for b in soltop._NOT_UTIL))
+
+
+def _core_view(n_e=4, n_p=10):
+    def cores(prefix, n):
+        return [{"name": f"{prefix}{i:03d}", "pct": 10.0 * i, "mhz": 50.0,
+                 "freq_unit": "%"} for i in range(n)]
+    return {
+        "gpu_pct": 0.0,
+        "clusters": [
+            {"key": "E", "label": "CPU E-cluster", "avg": 20.0, "count": n_e,
+             "mhz": 60.0, "freq_unit": "%", "per_core": cores("ECPU", n_e)},
+            {"key": "P", "label": "CPU P-cluster", "avg": 30.0, "count": n_p,
+             "mhz": 70.0, "freq_unit": "%", "per_core": cores("PCPU", n_p)},
+        ],
+    }
+
+
+class CoreViewTests(unittest.TestCase):
+    def test_every_core_is_listed(self):
+        frame = soltop.render(_core_view(), cols=90, procs=[], core_only=True)
+        for name in ("ECPU000", "ECPU003", "PCPU000", "PCPU009"):
+            self.assertIn(name, frame)
+        # The dashboard's cluster gauges must not appear in this view.
+        self.assertNotIn("GPU Usage:", frame)
+
+    def test_per_core_percent_and_dvfs_are_not_truncated_away(self):
+        # The bar must leave room for the value columns, or wrap_box() clips them.
+        frame = soltop.render(_core_view(), cols=90, procs=[], core_only=True)
+        self.assertIn("% DVFS", frame)
+        self.assertIn("30.00%", frame)   # ECPU003 -> pct 30.0
+
+    def test_core_view_fits_the_frame_and_keeps_the_box_intact(self):
+        for cols in (40, 60, 100):
+            for height in (6, 12, 30):
+                frame = soltop.render(_core_view(), cols=cols, procs=[],
+                                      height=height, core_only=True)
+                rows = frame.replace("\x1b[K", "").splitlines()
+                self.assertEqual(len(rows), height, (cols, height))
+                for row in rows:
+                    self.assertEqual(soltop._visible_len(row), cols, (cols, height))
+
+    def test_core_view_without_clusters_does_not_crash(self):
+        frame = soltop.render({"gpu_pct": 0.0, "clusters": []}, cols=60,
+                              procs=[], height=10, core_only=True)
+        self.assertIn("no CPU cores", frame)
 
 
 class SamplerLifecycleTests(unittest.TestCase):
@@ -188,7 +268,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.4.2")
+        self.assertEqual(soltop.__version__, "0.5.0")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200

@@ -1,6 +1,6 @@
 # soltop
 
-Current version: **0.4.2**
+Current version: **0.5.0**
 
 An Apple Silicon GPU / CPU / power monitor for the terminal — like `asitop`,
 but **without `sudo` and without `powermetrics`**.
@@ -14,7 +14,8 @@ user privileges.
 - **Per-process GPU usage** (like `nvidia-smi`), read from the driver's
   IORegistry accounting — no sudo
 - **Power**: CPU / GPU / ANE / DRAM / Total (cur / avg / peak) + history graph
-- **CPU** E/P clusters: usage + DVFS level, with core counts
+- **CPU** E/P clusters: usage + DVFS level, with core counts (press `c` for a
+  per-core breakdown)
 - **Memory**: used / wired / compressed / swap
 - **Thermal / throttle** state
 - Auto-fits the terminal size, boxed asitop-style UI
@@ -34,8 +35,15 @@ soltop --once       # print one frame and exit
 soltop --version
 ```
 
-While running, press `p` to toggle between the dashboard and the full GPU
-process list. Press `q` (or `Ctrl-C`) to quit.
+While running:
+
+| key | action |
+|-----|--------|
+| `p` | toggle the full GPU process list |
+| `c` | toggle the per-core CPU view (every E/P core individually, instead of the cluster averages) |
+| `q` | quit (`Ctrl-C` also works) |
+
+Pressing the same key again returns to the dashboard.
 
 ## Requirements
 

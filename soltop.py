@@ -9,7 +9,7 @@ import re
 import time
 from collections import deque
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 from ctypes import (
     c_void_p,
@@ -900,9 +900,18 @@ def organize(raw):
     for key in order:
         c = clusters[key]
         n = len(c["cores"])
+        table = tables.get(key, [])
         avg = sum(x["active"] for x in c["cores"]) / n * 100
-        mhz, unit = cluster_freq(c["cores"], tables.get(key, []))
-        out_clusters.append({**c, "avg": avg, "count": n, "mhz": mhz, "freq_unit": unit})
+        mhz, unit = cluster_freq(c["cores"], table)
+        # Per-core figures for the 'c' (per-core) view. Computed here rather than
+        # in render() so the DVFS tables stay out of the display layer.
+        per_core = []
+        for x in c["cores"]:
+            cf, cu = cluster_freq([x], table)
+            per_core.append({"name": x["name"], "pct": x["active"] * 100,
+                             "mhz": cf, "freq_unit": cu})
+        out_clusters.append({**c, "avg": avg, "count": n, "mhz": mhz,
+                             "freq_unit": unit, "per_core": per_core})
 
     return {"gpu_pct": gpu_pct, "gpu_channels": gpu_ch, "gpu_mhz": gpu_mhz,
             "gpu_freq_unit": gpu_unit,
@@ -1094,8 +1103,40 @@ def _freq_txt(value, unit):
     return f"@ {value:.0f}% DVFS"
 
 
+def render_cores(view, width, limit=None):
+    """Render every CPU core individually, grouped by cluster.
+
+    The dashboard shows one gauge per cluster (the E/P averages); this is the
+    same data broken out per core, so a single pegged core is visible instead of
+    being averaged away.
+    """
+    # Leave room for the name, the "100.00%" column and the "@ 100% DVFS" suffix,
+    # or the bar would push them past the border and they'd be truncated away.
+    bw = max(8, width - 30)
+    lines = []
+    for c in view.get("clusters", []):
+        if limit is not None and len(lines) >= limit:
+            break
+        ftxt = _freq_txt(c.get("mhz", 0.0), c.get("freq_unit", "MHz"))
+        head = f"{HEADER} {c['label']}  ({c['count']} cores)  avg {c['avg']:.1f}%"
+        lines.append(head + (f"  {ftxt}" if ftxt else "") + RESET)
+        for core in c.get("per_core", []):
+            if limit is not None and len(lines) >= limit:
+                break
+            cf = _freq_txt(core.get("mhz", 0.0), core.get("freq_unit", "MHz"))
+            pct = core["pct"]
+            lines.append("  %-8s %s %6.2f%%  %s"
+                         % (core["name"], bar(pct, bw), pct, cf))
+        lines.append("")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if not lines:
+        lines.append("  \x1b[2m(no CPU cores found)\x1b[0m")
+    return lines
+
+
 def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
-           process_only=False, single_sample=False):
+           process_only=False, single_sample=False, core_only=False):
     """Draw the organize() result (view). Does no data-structure reasoning.
 
     ``single_sample`` suppresses the avg/peak columns, which carry no information
@@ -1113,10 +1154,8 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
         thr = " throttling" if ts >= 1 else ""
         title += f"   thermal: {tcolor}{tname}{thr}{RESET}"
 
-    if process_only:
-        title = "Soltop · GPU Processes · p: dashboard · q: quit"
-        limit = max(1, height - 4) if height else 10
-        lines.extend(render_procs(procs or [], limit=limit))
+    def _fit(lines, title):
+        """Pad/clip content to the frame and draw the border."""
         if height:
             content_height = max(0, height - 2)
             del lines[content_height:]
@@ -1124,7 +1163,19 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
                 lines.append("")
         return ("\x1b[K\n").join(wrap_box(lines, cols, title)) + "\x1b[K"
 
-    title += "   p: processes   q: quit"
+    if process_only:
+        title = "Soltop · GPU Processes · p: dashboard · q: quit"
+        limit = max(1, height - 4) if height else 10
+        lines.extend(render_procs(procs or [], limit=limit))
+        return _fit(lines, title)
+
+    if core_only:
+        title = "Soltop · CPU Cores · c: dashboard · q: quit"
+        limit = max(1, height - 2) if height else None
+        lines.extend(render_cores(view, width, limit=limit))
+        return _fit(lines, title)
+
+    title += "   p: processes   c: cores   q: quit"
 
     freq_txt = _freq_txt(view.get("gpu_mhz", 0.0), view.get("gpu_freq_unit", "MHz"))
     cur = view["gpu_pct"]
@@ -1205,19 +1256,10 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
     if lines and lines[-1] == "":
         lines.pop()
 
-    # Fit the complete frame to the available screen height. On very short
-    # terminals, lower-priority content at the bottom is omitted.
-    if height:
-        content_height = max(0, height - 2)
-        del lines[content_height:]
-        while len(lines) < content_height:
-            lines.append("")
-
-    # Draw a full outer border with the machine name + thermal as the title.
-    boxed = wrap_box(lines, cols, title)
-
-    # Clear each line end (ESC[K) to remove longer leftovers from the prior frame.
-    return ("\x1b[K\n").join(boxed) + "\x1b[K"
+    # _fit() pads/clips to the screen height (on very short terminals the
+    # lower-priority content at the bottom is omitted), draws the outer border,
+    # and clears each line end so longer leftovers from the prior frame go away.
+    return _fit(lines, title)
 
 
 class KeyReader:
@@ -1268,6 +1310,7 @@ def live(interval=1.0, cols_override=None):
     print(HIDE_CURSOR + CLEAR, end="", flush=True)
     last_size = None
     process_only = False
+    core_only = False
     try:
         with KeyReader(sys.stdin) as keys:
             while True:
@@ -1278,10 +1321,16 @@ def live(interval=1.0, cols_override=None):
                     procs = proc_sampler.step(interval)
                 except Exception:
                     procs = []
-                # Handle each key in order: every 'p' toggles, 'q'/ESC quits.
+                # Handle each key in order: 'p' toggles the process view, 'c' the
+                # per-core view (each returns to the dashboard when pressed again,
+                # and the two views are mutually exclusive), 'q'/ESC quits.
                 for k in keys.read_available().lower():
                     if k == "p":
                         process_only = not process_only
+                        core_only = False
+                    elif k == "c":
+                        core_only = not core_only
+                        process_only = False
                     elif k in ("q", "\x1b", "\x03"):
                         return
                 tcols, rows = term_size()
@@ -1291,7 +1340,8 @@ def live(interval=1.0, cols_override=None):
                     print(CLEAR, end="")
                     last_size = (cols, rows)
                 frame = render(view, cols, gpu_hist, procs, height=rows,
-                               soc_hist=soc_hist, process_only=process_only)
+                               soc_hist=soc_hist, process_only=process_only,
+                               core_only=core_only)
                 # Overwrite the whole frame in one write, then clear any lines below.
                 print(HOME + frame + CLEAR_TO_END, end="", flush=True)
     except KeyboardInterrupt:
