@@ -324,13 +324,19 @@ CPU_PERIOD_NUMERATOR = 65_532_288
 # wrong ladder on the next chip -- confidently, and with no symptom other than a
 # wrong number. Instead, discover every voltage-states* table and bind each
 # cluster to one by matching the ladder LENGTH against the cluster's P-state
-# count, which IOReport reports per core (see load_dvfs/match_ladder).
+# count, which IOReport reports per core (see load_dvfs/match_cpu_ladder).
 _VOLTAGE_STATE_RE = re.compile(r"^voltage-states(\d+)(-sram)?$")
 
 # Plausibility bounds. A derived ladder outside these is not a CPU/GPU DVFS
 # table (or the encoding changed), and printing a clock from it would be a
 # fabrication -- so the caller shows no MHz instead.
 _SANE_MHZ = (100.0, 10_000.0)
+
+# An Apple GPU clocks far below its CPU (an M4 Pro tops out at 1578 MHz, an M5
+# Pro at 1620). Several unrelated Hz tables sit alongside it in the IORegistry
+# -- 801..2004 and 732..2472 on an M5 -- so a ceiling is what tells them apart.
+# Generous enough to allow for headroom on future parts.
+_GPU_MAX_MHZ = 1900.0
 
 
 def _read_voltage_state_tables():
@@ -398,14 +404,22 @@ def _decode_ladder(vals):
     if not vals:
         return None
     lo, hi = _SANE_MHZ
-    # 'period' identifies a CPU table, 'absolute' (Hz/kHz) a GPU one -- the CPU
-    # tables store the period of each step while the GPU's store plain Hz. The
-    # kind is returned so a GPU channel cannot bind a CPU ladder: on an M5 Pro
-    # the GPU's 15 P-states would otherwise match the 15-step P ladder and
-    # render the GPU at 4380 MHz.
-    for kind, mhz in (("absolute", [v / 1e6 for v in vals]),     # Hz  -> MHz
-                      ("absolute", [v / 1e3 for v in vals]),     # kHz -> MHz (-sram)
+    # Three encodings, and the kind must come from the ENCODING, not merely from
+    # landing in a sane MHz range:
+    #
+    #   Hz     (>= 1e8)  -- a GPU table, the only one stored as a true frequency
+    #   kHz    (~1e6)    -- a '-sram' twin of a CPU table, NOT a GPU table
+    #   period (small)   -- a CPU table (MHz = CPU_PERIOD_NUMERATOR / raw)
+    #
+    # Lumping Hz and kHz together as one "absolute" kind is what let a CPU
+    # ladder be handed to the GPU: on an M5 Pro, voltage-states22-sram decodes
+    # from kHz to 1344..4380 MHz, and the GPU bound to it and reported 1644 MHz
+    # against a real ladder that tops out at 1620.
+    for kind, mhz in (("gpu", [v / 1e6 for v in vals] if min(vals) >= 1e8 else None),
+                      ("sram", [v / 1e3 for v in vals]),
                       ("period", [CPU_PERIOD_NUMERATOR / v for v in vals])):
+        if mhz is None:
+            continue
         ladder = sorted(mhz)
         if lo <= ladder[0] and ladder[-1] <= hi:
             return (kind, ladder)
@@ -417,7 +431,7 @@ def load_dvfs():
 
     Keyed by the raw IORegistry key name ('voltage-states5', ...), NOT by
     cluster: which table belongs to which cluster is decided later, by matching
-    ladder length against the cluster's P-state count (see match_ladder). The
+    ladder length against the cluster's P-state count (see match_cpu_ladder). The
     numbering differs per chip, so this layer must not presume a mapping.
     ``kind`` is 'period' for CPU tables and 'absolute' for GPU ones.
     """
@@ -434,37 +448,59 @@ def load_dvfs():
     return tables
 
 
-def match_ladder(nsteps, tables, kind="period"):
-    """Pick the DVFS ladder for a cluster with ``nsteps`` P-states, or [].
+def _rank_key(item):
+    """Order tables by key number, so the choice is stable, not dict-ordered."""
+    key, _ = item
+    m = _VOLTAGE_STATE_RE.match(key)
+    return int(m.group(1)) if m else 1 << 30
 
-    IOReport reports each core's P-states by name (V0P18, V1P17, ...), so the
-    number of non-idle states IS the length of that cluster's ladder. A table of
-    the right ``kind`` with exactly that many entries is the cluster's ladder.
 
-    ``kind`` keeps the CPU and GPU table families apart ('period' vs 'absolute').
-    Length alone is not enough: an M5 Pro's GPU exposes 15 P-states and so would
-    otherwise match the 15-step *CPU* P ladder and report the GPU at 4380 MHz.
+def match_cpu_ladder(nsteps, tables):
+    """Pick the CPU ladder for a cluster with ``nsteps`` P-states, or [].
+
+    IOReport names each core's P-states V0P18, V1P17, ... so the number of
+    non-idle states IS the length of that cluster's ladder, and a CPU table with
+    exactly that many entries is the cluster's.
 
     Verified on an M5 Pro, where the key numbering is nothing like the M4's:
-    S-cluster (20 steps) binds to voltage-states5, P0/P1 (15 steps each) to
+    the S-cluster (20 steps) binds to voltage-states5, P0/P1 (15 steps each) to
     voltage-states22/23 -- and the E-cluster key the old code hardcoded does not
     exist on that chip.
 
-    Ambiguity is resolved by preferring the non-sram table, then the lowest key
-    number, so P0 and P1 (identical 15-step ladders, differing only in voltage)
-    both resolve to the same frequencies -- which is correct: powermetrics
-    prints the same ladder for both.
+    P0 and P1 have identical ladders (they differ only in voltage), so both
+    resolve to the same frequencies. That is correct: powermetrics prints the
+    same ladder for both.
     """
     if not nsteps:
         return []
-    def rank(item):
-        key, _ = item
-        m = _VOLTAGE_STATE_RE.match(key)
-        num = int(m.group(1)) if m else 1 << 30
-        is_sram = bool(m and m.group(2))
-        return (is_sram, num)
-    for key, (tkind, ladder) in sorted(tables.items(), key=rank):
-        if tkind == kind and len(ladder) == nsteps:
+    for _, (kind, ladder) in sorted(tables.items(), key=_rank_key):
+        if kind == "period" and len(ladder) == nsteps:
+            return ladder
+    return []
+
+
+def match_gpu_ladder(tables, cap_mhz=_GPU_MAX_MHZ):
+    """Pick the GPU ladder, or [].
+
+    NOT chosen by step count. The GPU's IOReport states are a fixed P1..P15 set
+    on both an M4 Pro and an M5 Pro, while the real ladder has 15 entries on an
+    M4 and 13 on an M5 -- so the state count is not the ladder length and must
+    not be matched against one. (Doing so bound the M5's GPU to a 15-step *CPU*
+    table and reported 1644 MHz, above the 1620 MHz top of its real ladder.)
+
+    Chosen instead by the two properties that actually identify a GPU table:
+
+      * it is stored as true Hz -- the CPU tables store a period, and their
+        '-sram' twins store kHz, which is what leaked a CPU ladder to the GPU;
+      * an Apple GPU clocks far below its CPU, so a ladder topping out above
+        cap_mhz is some other unit's table (an M5 Pro exposes several Hz tables:
+        the GPU's 338..1620, plus 801..2004 and 732..2472 which are not).
+
+    Among the candidates the lowest key number wins -- voltage-states9 on both
+    chips we have data for.
+    """
+    for _, (kind, ladder) in sorted(tables.items(), key=_rank_key):
+        if kind == "gpu" and ladder[-1] <= cap_mhz:
             return ladder
     return []
 
@@ -1170,7 +1206,7 @@ def organize(raw):
     # --- GPU: average across channels if there is more than one ---
     gpu_ch = raw.get("gpu", [])
     gpu_pct = (sum(e["active"] for e in gpu_ch) / len(gpu_ch) * 100) if gpu_ch else 0.0
-    gpu_mhz = cluster_freq_mhz(gpu_ch, match_ladder(_nsteps(gpu_ch), tables, "absolute"))
+    gpu_mhz = cluster_freq_mhz(gpu_ch, match_gpu_ladder(tables))
 
     # --- CPU: group only the per-core (state residency) channels by cluster ---
     cores = [e for e in raw.get("cpu", []) if "COMPLEX" not in (e["subgroup"] or "").upper()]
@@ -1179,8 +1215,8 @@ def organize(raw):
     for c in group_clusters(cores):
         n = len(c["cores"])
         # Bind this cluster's ladder by its own P-state count, not by its name:
-        # the voltage-states numbering differs per chip (see match_ladder).
-        table = match_ladder(_nsteps(c["cores"]), tables)
+        # the voltage-states numbering differs per chip (see match_cpu_ladder).
+        table = match_cpu_ladder(_nsteps(c["cores"]), tables)
         avg = sum(x["active"] for x in c["cores"]) / n * 100
         mhz = cluster_freq_mhz(c["cores"], table)
         # Per-core figures for the 'c' (per-core) view. Computed here rather than

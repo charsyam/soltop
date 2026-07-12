@@ -36,7 +36,7 @@ def main():
     print("\nclusters as soltop groups them:")
     for c in soltop.group_clusters(cores):
         nsteps = soltop._nsteps(c["cores"])
-        ladder = soltop.match_ladder(nsteps, soltop.DVFS, "period")
+        ladder = soltop.match_cpu_ladder(nsteps, soltop.DVFS)
         avg = (sum(x["active"] for x in c["cores"]) / len(c["cores"]) * 100)
         mhz = soltop.cluster_freq_mhz(c["cores"], ladder)
         print(f"\n  {c['key']:3s} {c['label']:16s} cores={len(c['cores'])} "
@@ -53,8 +53,9 @@ def main():
     gpu = raw.get("gpu", [])
     if gpu:
         gsteps = soltop._nsteps(gpu)
-        gladder = soltop.match_ladder(gsteps, soltop.DVFS, "absolute")
-        print(f"\n  GPU nsteps={gsteps} ladder={len(gladder)} steps  "
+        gladder = soltop.match_gpu_ladder(soltop.DVFS)
+        top = f"{gladder[-1]:.0f}" if gladder else "-"
+        print(f"\n  GPU nsteps={gsteps} ladder={len(gladder)} steps (top {top} MHz)  "
               f"mhz={soltop.cluster_freq_mhz(gpu, gladder):.0f}")
 
 

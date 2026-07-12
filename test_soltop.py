@@ -593,40 +593,51 @@ class SoltopLogicTests(unittest.TestCase):
             "voltage-states5": ("period", [1308, 4608]),          # M5: S (2 steps)
             "voltage-states22": ("period", [1344, 2000, 4380]),   # M5: P0/P1 (3)
         }
-        self.assertEqual(soltop.match_ladder(2, tables), [1308, 4608])
-        self.assertEqual(soltop.match_ladder(3, tables), [1344, 2000, 4380])
+        self.assertEqual(soltop.match_cpu_ladder(2, tables), [1308, 4608])
+        self.assertEqual(soltop.match_cpu_ladder(3, tables), [1344, 2000, 4380])
         # A cluster whose ladder is absent gets no clock, rather than a wrong one.
-        self.assertEqual(soltop.match_ladder(9, tables), [])
-        self.assertEqual(soltop.match_ladder(0, tables), [])
+        self.assertEqual(soltop.match_cpu_ladder(9, tables), [])
+        self.assertEqual(soltop.match_cpu_ladder(0, tables), [])
 
     def test_gpu_cannot_bind_a_cpu_ladder(self):
-        # An M5 Pro's GPU exposes 15 P-states -- the same count as its CPU P
-        # ladder. Matching on length alone would render the GPU at 4380 MHz, so
-        # the CPU ('period') and GPU ('absolute') table families are kept apart.
+        # The GPU's IOReport states are a fixed P1..P15 set on both chips, but
+        # the real ladder is 15 steps on an M4 and 13 on an M5 -- so the state
+        # count is NOT the ladder length and must not be matched against one.
+        # Matching by length bound the M5's GPU to a 15-step CPU table (via its
+        # kHz '-sram' twin) and reported 1644 MHz, above the 1620 MHz top of the
+        # real GPU ladder.
         tables = {
-            "voltage-states22": ("period", [1344.0] * 15),     # CPU P ladder
-            "voltage-states9": ("absolute", [338.0] * 15),     # GPU ladder
+            "voltage-states9": ("gpu", [338.0, 1620.0]),          # the real GPU
+            "voltage-states22": ("period", [1344.0] * 15),        # CPU P ladder
+            "voltage-states22-sram": ("sram", [1344.0] * 15),     # its kHz twin
         }
-        self.assertEqual(soltop.match_ladder(15, tables, "absolute"), [338.0] * 15)
-        self.assertEqual(soltop.match_ladder(15, tables, "period"), [1344.0] * 15)
+        self.assertEqual(soltop.match_gpu_ladder(tables), [338.0, 1620.0])
+        # ... and the CPU still binds its own.
+        self.assertEqual(soltop.match_cpu_ladder(15, tables), [1344.0] * 15)
 
-    def test_ladder_prefers_the_non_sram_twin(self):
-        # The '-sram' tables carry the same ladder (in kHz), so both decode to
-        # the same MHz; pin the choice so it is stable rather than dict-ordered.
-        tables = {"voltage-states5-sram": ("period", [1308, 4608]),
-                  "voltage-states5": ("period", [1308, 4608])}
-        self.assertEqual(soltop.match_ladder(2, tables), [1308, 4608])
+    def test_gpu_ignores_the_other_hz_tables(self):
+        # An M5 Pro exposes several Hz tables beside the GPU's: 801..2004 and
+        # 732..2472 are not GPU ladders. An Apple GPU clocks far below its CPU,
+        # so the ceiling is what tells them apart -- picking the lowest-numbered
+        # Hz table would have chosen voltage-states8 (732..2472).
+        tables = {
+            "voltage-states8": ("gpu", [732.0, 2472.0]),
+            "voltage-states9": ("gpu", [338.0, 1620.0]),
+        }
+        self.assertEqual(soltop.match_gpu_ladder(tables), [338.0, 1620.0])
+        self.assertEqual(soltop.match_gpu_ladder({}), [])
 
-    def test_decode_ladder_rejects_a_table_it_cannot_read(self):
-        # Neither reading of these lands in a plausible MHz range, so no clock is
-        # reported -- a fabricated number is worse than a missing one.
+    def test_decode_ladder_identifies_the_encoding(self):
+        # The kind must come from the ENCODING, not merely from landing in a
+        # sane MHz range: a CPU table's kHz '-sram' twin decodes to a plausible
+        # MHz ladder too, and lumping it in with the GPU's true-Hz tables is
+        # what handed a CPU ladder to the GPU.
         self.assertIsNone(soltop._decode_ladder([1, 1, 1]))
         self.assertIsNone(soltop._decode_ladder([]))
-        # Hz (GPU) and kHz ('-sram') are absolute; the CPU tables are periods.
         self.assertEqual(soltop._decode_ladder([338000000, 1620000000]),
-                         ("absolute", [338.0, 1620.0]))
+                         ("gpu", [338.0, 1620.0]))        # true Hz -> GPU
         self.assertEqual(soltop._decode_ladder([1308000, 4608000]),
-                         ("absolute", [1308.0, 4608.0]))
+                         ("sram", [1308.0, 4608.0]))      # kHz -> a CPU twin
         kind, ladder = soltop._decode_ladder([50103, 14222])
         self.assertEqual((kind, [round(v) for v in ladder]), ("period", [1308, 4608]))
 
