@@ -130,8 +130,36 @@ def hw():
         print(f"{cmd[-1]:35s} {out}")
 
 
+def channels():
+    """Print the IOReport CPU/GPU channel names and their P-state names.
+
+    This is what soltop actually groups cores by -- NOT the powermetrics cluster
+    labels. The core-name format ('PCPU000', 'ECPU010', ...) is what decides the
+    cluster split, and it is not safe to assume it carries across chips.
+    """
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    import soltop
+
+    s = soltop.Sampler()
+    raw = s.read(0.5)
+    for kind in ("cpu", "gpu"):
+        for e in raw.get(kind, []):
+            names = list(e.get("states") or {})
+            nactive = sum(1 for n in names if not soltop.is_idle_state(n))
+            print(f"  {kind}  name={e['name']!r}")
+            print(f"        group={e.get('group')!r}  subgroup={e.get('subgroup')!r}")
+            print(f"        {len(names)} states ({nactive} non-idle): {names}")
+
+
 if __name__ == "__main__":
     print("--- hardware -----------------------------------------------")
     hw()
+    print("\n--- ioreport channels --------------------------------------")
+    try:
+        channels()
+    except Exception as e:
+        print(f"  (failed: {e})")
     print("\n--- voltage-states -----------------------------------------")
     dump()
