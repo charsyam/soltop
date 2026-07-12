@@ -110,11 +110,34 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertIsNone(soltop.active_ratio({"P0": 10, "P1": 20}))
 
     def test_cluster_frequency_ignores_idle_residency(self):
-        cores = [{"states": {"IDLE": 100, "V0P1": 20, "V0P2": 20}}]
+        # V ascends with the DVFS step: V1 -> 2000, V2 -> 3000.
+        cores = [{"states": {"IDLE": 100, "V1P1": 20, "V2P0": 20}}]
         self.assertEqual(soltop.cluster_freq_mhz(cores, [1000, 2000, 3000]), 2500)
 
+    def test_pstate_index_reads_the_ascending_v_field(self):
+        # CPU names are V<v>P<p> with v ascending and p descending, so
+        # v + p == len(ladder) - 1. Reading the P suffix inverts the ladder:
+        # V18P0 is the TOP step but parses as index 0, the ladder floor -- which
+        # made a pegged CPU report its minimum clock.
+        for name, want in (("V0P18", 0), ("V9P9", 9), ("V18P0", 18),
+                           ("V0P6", 0), ("V6P0", 6)):
+            self.assertEqual(soltop._pstate_index(name), want, name)
+
+    def test_pstate_index_falls_back_to_a_plain_suffix(self):
+        # GPU state names carry no V field.
+        self.assertEqual(soltop._pstate_index("P3"), 3)
+        self.assertIsNone(soltop._pstate_index("GPUPH"))
+        self.assertIsNone(soltop._pstate_index(""))
+
+    def test_top_dvfs_state_maps_to_the_top_of_the_ladder(self):
+        ladder = [1000, 2000, 3000]          # 3 steps -> names V0P2, V1P1, V2P0
+        top = [{"states": {"V2P0": 100}}]
+        bottom = [{"states": {"V0P2": 100}}]
+        self.assertEqual(soltop.cluster_freq_mhz(top, ladder), 3000)
+        self.assertEqual(soltop.cluster_freq_mhz(bottom, ladder), 1000)
+
     def test_cluster_freq_reports_table_unit(self):
-        cores = [{"states": {"V0P1": 10}}]
+        cores = [{"states": {"V1P1": 10}}]      # V=1 -> ladder index 1
         mhz = {"values": [1000, 2000, 3000], "unit": "MHz"}
         self.assertEqual(soltop.cluster_freq(cores, mhz), (2000, "MHz"))
         # A scale-less CPU ladder must be reported as a percentage, never as MHz.

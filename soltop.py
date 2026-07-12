@@ -5,6 +5,7 @@ Computes GPU/CPU active utilization from P-State residency on Apple Silicon.
 """
 import ctypes
 import ctypes.util
+import re
 import time
 from collections import deque
 
@@ -227,12 +228,15 @@ def discover_state_channels():
     if not all_ch:
         raise RuntimeError("IOReportCopyAllChannels failed")
 
-    available, seen = [], set()
+    # Keep discovery order stable: a set would let the merge order (and hence the
+    # order channels appear in the UI) vary between runs.
+    seen, available = [], []
     for chan in iter_channels(all_ch):
         group = from_cfstr(IOR.IOReportChannelGetGroup(chan))
         subgroup = from_cfstr(IOR.IOReportChannelGetSubGroup(chan))
-        if classify_group(group) and subgroup:
-            seen.add((group, subgroup))
+        pair = (group, subgroup)
+        if classify_group(group) and subgroup and pair not in seen:
+            seen.append(pair)
 
     for kind, names in _UTIL_SUBGROUPS.items():
         for group, subgroup in seen:
@@ -351,15 +355,33 @@ def load_dvfs():
     return tables
 
 
+_VP_RE = re.compile(r"^V(\d+)P(\d+)$")   # CPU: V ascends with the step, P descends
+_P_RE = re.compile(r".*?P(\d+)$")        # GPU / fallback: plain ascending suffix
+
+
 def _pstate_index(name):
-    """Parse the P-state index from a state name like 'V0P18' -> 18."""
-    if not name or "P" not in name:
+    """DVFS ladder index (ascending: 0 = slowest) from a state name like 'V18P0'.
+
+    CPU state names are 'V<v>P<p>', where the two counters run in OPPOSITE
+    directions: v ascends with the voltage/frequency step while p descends, so
+    v + p == len(ladder) - 1 for every state in a cluster (e.g. the 19-step P
+    ladder yields V0P18, V1P17, ... V18P0). Reading the P suffix as the ladder
+    index therefore inverts the ladder -- V18P0, the TOP step, parses as 0 and
+    lands on the ladder floor -- which reported a pegged CPU at its minimum
+    clock. The V field is the ascending index, so use that.
+
+    GPU state names have no V field ('P3', 'GPUPH'); fall back to the numeric
+    suffix there, which is already ascending.
+    """
+    if not name:
         return None
-    tail = name.rsplit("P", 1)[-1]
-    try:
-        return int(tail)
-    except ValueError:
-        return None
+    m = _VP_RE.match(name)
+    if m:
+        return int(m.group(1))
+    m = _P_RE.match(name)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def cluster_freq_mhz(cores, table):
@@ -988,19 +1010,15 @@ def hgauge(label, frac, width, value=""):
     return [title, f"  [{gauge_bar(frac, width)}]"]
 
 
-_ANSI_RE = None
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 
 def _ansi_re():
-    import re
-    global _ANSI_RE
-    if _ANSI_RE is None:
-        _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
     return _ANSI_RE
 
 
 def _visible_len(s):
-    return len(_ansi_re().sub("", s))
+    return len(_ANSI_RE.sub("", s))
 
 
 def _truncate_visible(s, width):
