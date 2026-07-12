@@ -1,5 +1,7 @@
 # soltop
 
+Current version: **0.2.0**
+
 An Apple Silicon GPU / CPU / power monitor for the terminal — like `asitop`,
 but **without `sudo` and without `powermetrics`**.
 

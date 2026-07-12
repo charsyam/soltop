@@ -7,7 +7,7 @@ import ctypes
 import ctypes.util
 import time
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from ctypes import (
     c_void_p,
@@ -343,9 +343,10 @@ class Sampler:
                 DVFS = {}
         self.subscribed, self.chans, self.sub = build_subscription()
         self.prev = IOR.IOReportCreateSamples(self.subscribed, self.chans, None)
-        # Retain the last observed value per channel so a channel that is
-        # missing this sample (fully parked core) still shows its last value.
-        self.last = {}          # key -> entry (last observed value)
+        self.prev_time = time.monotonic()
+        # Retain channel metadata across samples; missing/parked channels have
+        # their measurements reset to zero in read().
+        self.last = {}          # key -> most recent entry
         self.order = {}         # group -> [key, ...] preserve observed order
         self.power = {}         # label -> power in mW (from Energy Model)
         self.power_max = {}     # label -> bar full-scale (floored, for scaling)
@@ -367,11 +368,13 @@ class Sampler:
         self._release()
         self.subscribed, self.chans, self.sub = build_subscription()
         self.prev = IOR.IOReportCreateSamples(self.subscribed, self.chans, None)
+        self.prev_time = time.monotonic()
 
     def read(self, interval=1.0):
         time.sleep(interval)
 
         cur = IOR.IOReportCreateSamples(self.subscribed, self.chans, None)
+        cur_time = time.monotonic()
         delta = IOR.IOReportCreateSamplesDelta(self.prev, cur, None) if cur else None
         if not self.prev or not cur or not delta:
             # Subscription may have dropped: clean up and re-subscribe once.
@@ -380,6 +383,7 @@ class Sampler:
             self._recreate()
             time.sleep(interval)
             cur = IOR.IOReportCreateSamples(self.subscribed, self.chans, None)
+            cur_time = time.monotonic()
             delta = IOR.IOReportCreateSamplesDelta(self.prev, cur, None) if cur else None
             if not cur or not delta:
                 if cur:
@@ -389,9 +393,13 @@ class Sampler:
         # The previous sample is no longer needed: release and swap in the new one.
         CF.CFRelease(self.prev)
         self.prev = cur
+        elapsed = max(cur_time - self.prev_time, 1e-9)
+        self.prev_time = cur_time
+
+        observed = set()
+        current_power = {lbl: 0.0 for lbl in ("CPU", "GPU", "ANE", "DRAM")}
 
         # Update observed channels with their real active value (0 if idle).
-        # Channels missing this cycle (fully parked) keep their last value.
         for chan in iter_channels(delta):
             group = from_cfstr(IOR.IOReportChannelGetGroup(chan))
             name = from_cfstr(IOR.IOReportChannelGetChannelName(chan))
@@ -401,9 +409,9 @@ class Sampler:
                 if name in ENERGY_KEYS:
                     try:
                         energy = IOR.IOReportSimpleGetIntegerValue(chan, 0)
-                        self.power[ENERGY_KEYS[name]] = max(0.0, energy / interval)
+                        current_power[ENERGY_KEYS[name]] = max(0.0, energy / elapsed)
                     except Exception:
-                        self.power.setdefault(ENERGY_KEYS[name], 0.0)
+                        pass
                 continue
 
             if classify_group(group) is None:
@@ -414,6 +422,7 @@ class Sampler:
                 continue
 
             key = (group, subgroup, name)
+            observed.add(key)
             if key not in self.order.setdefault(group, []):
                 self.order[group].append(key)
 
@@ -428,12 +437,18 @@ class Sampler:
                 "states": states,
             }
 
+        # A state channel omitted from a delta is normally parked/inactive. Do
+        # not retain a prior busy value, which would create phantom utilization.
+        for key, entry in self.last.items():
+            if key not in observed:
+                entry.update(active=0.0, total=0, states={})
+
         # Values from delta are already copied into Python dicts, so release it.
         CF.CFRelease(delta)
 
-        # Safety: any missing component defaults to 0; SoC = sum of components.
-        for lbl in ("CPU", "GPU", "ANE", "DRAM"):
-            self.power.setdefault(lbl, 0.0)
+        # Missing energy channels mean no value for this delta, not "reuse the
+        # previous sample". Reset them to zero to avoid stale power readings.
+        self.power = current_power
         self.power["SoC"] = sum(self.power[l] for l in ("CPU", "GPU", "ANE", "DRAM"))
         # Bar scale: a sensible per-component full-scale, grown if exceeded.
         # Also accumulate peak and running average per component.
@@ -445,7 +460,7 @@ class Sampler:
             self.power_sum[lbl] = self.power_sum.get(lbl, 0.0) + mw
         power_avg = {lbl: s / self.power_cnt for lbl, s in self.power_sum.items()}
 
-        # Emit in observed order; channels missing this cycle keep their last value.
+        # Emit in observed order, including parked channels reset to zero.
         gpu, cpu = [], []
         for group, keys in self.order.items():
             dst = gpu if classify_group(group) == "gpu" else cpu
@@ -567,27 +582,32 @@ class ProcGPUSampler:
 
     def __init__(self):
         self.prev = {}   # pid -> (name, accumulated_ns)
+        self.prev_time = None
 
     def read(self, interval=1.0):
         self.prev = _gpu_client_totals()
+        self.prev_time = time.monotonic()
         time.sleep(interval)
-        return self.step(interval)
+        return self.step()
 
-    def step(self, interval):
+    def step(self, interval=None):
         """Diff against the previous snapshot without sleeping (for live loop).
 
-        Assumes `interval` seconds elapsed since the last call. First call
-        primes the baseline and returns an empty list.
+        Uses monotonic time between snapshots. ``interval`` is retained for
+        backward compatibility and only used when no timestamp is available.
         """
         snap = _gpu_client_totals()
+        now = time.monotonic()
+        elapsed = now - self.prev_time if self.prev_time is not None else interval
         rows = []
         for pid, (name, ns2) in snap.items():
             if pid in self.prev:
                 dns = ns2 - self.prev[pid][1]
-                if dns > 0:
+                if dns > 0 and elapsed and elapsed > 0:
                     rows.append({"pid": pid, "name": name,
-                                 "gpu_ms_s": dns / 1e6 / interval})
+                                 "gpu_ms_s": dns / 1e6 / elapsed})
         self.prev = snap
+        self.prev_time = now
         rows.sort(key=lambda r: r["gpu_ms_s"], reverse=True)
         return rows
 
@@ -1043,8 +1063,22 @@ def main():
     import argparse
 
     p = argparse.ArgumentParser(prog="soltop", description="Apple Silicon GPU/CPU usage monitor")
-    p.add_argument("-i", "--interval", type=float, default=1.0, help="sampling interval (seconds)")
-    p.add_argument("-c", "--cols", type=int, default=0,
+    def positive_float(value):
+        import math
+        parsed = float(value)
+        if not math.isfinite(parsed) or parsed <= 0:
+            raise argparse.ArgumentTypeError("must be a finite number greater than 0")
+        return parsed
+
+    def nonnegative_int(value):
+        parsed = int(value)
+        if parsed < 0:
+            raise argparse.ArgumentTypeError("must be 0 or greater")
+        return parsed
+
+    p.add_argument("-i", "--interval", type=positive_float, default=1.0,
+                   help="sampling interval (seconds)")
+    p.add_argument("-c", "--cols", type=nonnegative_int, default=0,
                    help="terminal columns to use (0 = auto-fit)")
     p.add_argument("--once", action="store_true", help="print once and exit")
     p.add_argument("--version", action="version", version=f"soltop {__version__}")
@@ -1052,11 +1086,17 @@ def main():
     cols_override = args.cols or None
 
     if args.once:
-        view = organize(sample(args.interval))
+        sampler = Sampler()
+        try:
+            proc_sampler = ProcGPUSampler()
+            proc_sampler.step()  # establish the process baseline before the wait
+        except Exception:
+            proc_sampler = None
+        view = organize(sampler.read(args.interval))
         hist = deque([view["gpu_pct"]])
         shist = deque([view.get("power", {}).get("SoC", 0) / 1000])
         try:
-            procs = ProcGPUSampler().read(args.interval)
+            procs = proc_sampler.step() if proc_sampler else []
         except Exception:
             procs = []
         tcols, rows = term_size()
