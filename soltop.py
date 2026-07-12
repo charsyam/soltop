@@ -10,7 +10,7 @@ import subprocess
 import time
 from collections import deque
 
-__version__ = "0.7.1"
+__version__ = "0.7.2"
 
 from ctypes import (
     c_void_p,
