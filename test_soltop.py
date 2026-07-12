@@ -152,6 +152,28 @@ def _core_view(n_e=4, n_p=10):
     }
 
 
+class GaugeStyleTests(unittest.TestCase):
+    def test_gauge_uses_a_solid_fill_not_the_eighth_block(self):
+        # '▏' paints only 1/8 of a cell, so the bar reads as washed out whatever
+        # colour it is given. The fill must be a solid block.
+        g = soltop.gauge_bar(0.5, 10)
+        self.assertIn("█", g)
+        self.assertIn("░", g)
+        self.assertNotIn("▏", g)
+
+    def test_gauge_colors_are_bold(self):
+        for pct, code in ((10, "1;92"), (60, "1;93"), (90, "1;91")):
+            self.assertEqual(soltop.color_for(pct), f"\x1b[{code}m")
+
+    def test_gauge_fill_tracks_the_fraction(self):
+        self.assertEqual(soltop.gauge_bar(0.0, 8).count("█"), 0)
+        self.assertEqual(soltop.gauge_bar(1.0, 8).count("█"), 8)
+        self.assertEqual(soltop.gauge_bar(0.5, 8).count("█"), 4)
+        # Out-of-range fractions clamp rather than overflow the bar.
+        self.assertEqual(soltop.gauge_bar(2.0, 8).count("█"), 8)
+        self.assertEqual(soltop.gauge_bar(-1.0, 8).count("█"), 0)
+
+
 class CoreViewTests(unittest.TestCase):
     def test_every_core_is_listed(self):
         frame = soltop.render(_core_view(), cols=90, procs=[], core_only=True)
@@ -268,7 +290,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.5.1")
+        self.assertEqual(soltop.__version__, "0.5.2")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200

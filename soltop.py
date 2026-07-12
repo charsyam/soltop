@@ -9,7 +9,7 @@ import re
 import time
 from collections import deque
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 from ctypes import (
     c_void_p,
@@ -936,36 +936,14 @@ EIGHTHS = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
 
 
 def color_for(pct):
+    # Bold ("1;") as well as bright ("9x"): on most terminal themes the bright
+    # colours alone render fairly washed out, and these bars are the thing the
+    # eye should land on first.
     if pct >= 80:
-        return "\x1b[91m"  # red
+        return "\x1b[1;91m"  # red
     if pct >= 50:
-        return "\x1b[93m"  # yellow
-    return "\x1b[92m"      # green
-
-
-def bar(pct, width=40):
-    pct = max(0.0, min(100.0, pct))
-    filled = int(round(pct / 100 * width))
-    reset = "\x1b[0m"
-    c = color_for(pct)
-    return f"{c}{'█' * filled}{reset}{'─' * (width - filled)}"
-
-
-def gauge_line(label, pct, width=40):
-    return f"  {label:<18} {bar(pct, width)} {pct:6.2f}%"
-
-
-def bar_frac(frac, width=40):
-    """Colored bar for an arbitrary 0..1 fraction."""
-    frac = max(0.0, min(1.0, frac))
-    filled = int(round(frac * width))
-    c = color_for(frac * 100)
-    return f"{c}{'█' * filled}{RESET}{'─' * (width - filled)}"
-
-
-def power_line(label, watts, max_watts, width=40):
-    frac = 0.0 if max_watts <= 0 else watts / max_watts
-    return f"  {label:<18} {bar_frac(frac, width)} {watts:6.2f}W"
+        return "\x1b[1;93m"  # yellow
+    return "\x1b[1;92m"      # green
 
 
 def vgraph(history, height=8, width=48, label_step=50, label_max=None, label_unit="%",
@@ -1022,11 +1000,15 @@ TRACK = "\x1b[90m"          # dim gray for the unfilled gauge track
 
 
 def gauge_bar(frac, width):
-    """asitop-style bar: bright '▏' ticks over a dim full-width '▏' track."""
+    """Solid '█' fill over a dim '░' track.
+
+    The fill used to be '▏' (a left-eighth block), which paints only 1/8 of each
+    cell -- so the bar read as washed out no matter which colour it was given.
+    """
     frac = max(0.0, min(1.0, frac))
     filled = int(round(frac * width))
     c = color_for(frac * 100)
-    return f"{c}{'▏' * filled}{TRACK}{'▏' * (width - filled)}{RESET}"
+    return f"{c}{'█' * filled}{TRACK}{'░' * (width - filled)}{RESET}"
 
 
 def hgauge(label, frac, width, value=""):
@@ -1218,7 +1200,8 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
             scale = 110.0
             norm = [min(100.0, (w / scale) * 100) for w in soc_hist]
             lines.extend(vgraph(norm, height=5, width=max(10, width - 7),
-                                label_max=scale, label_unit="W", color="\x1b[92m"))
+                                label_max=scale, label_unit="W",
+                                color="\x1b[1;92m"))
         lines.append(f"  {comp}" + ("" if single_sample else "   (cur/avg/peak)"))
         lines.append("")
 
