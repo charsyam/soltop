@@ -9,7 +9,7 @@ import re
 import time
 from collections import deque
 
-__version__ = "0.5.7"
+__version__ = "0.5.8"
 
 from ctypes import (
     c_void_p,
@@ -731,12 +731,14 @@ class ProcGPUSampler:
     """
 
     def __init__(self):
-        self.prev = {}   # pid -> (name, accumulated_ns)
+        self.prev = {}       # pid -> (name, accumulated_ns)
         self.prev_time = None
+        self.started = False  # have we taken a baseline snapshot yet?
 
     def read(self, interval=1.0):
         self.prev = _gpu_client_totals()
         self.prev_time = time.monotonic()
+        self.started = True
         time.sleep(interval)
         return self.step()
 
@@ -755,12 +757,26 @@ class ProcGPUSampler:
         if elapsed > 0:
             for pid, (name, ns2) in snap.items():
                 if pid in self.prev:
-                    dns = ns2 - self.prev[pid][1]
-                    if dns > 0:
-                        rows.append({"pid": pid, "name": name,
-                                     "gpu_ms_s": dns / 1e6 / elapsed})
+                    base = self.prev[pid][1]
+                elif self.started:
+                    # A pid we have never seen, but we HAVE snapshotted before:
+                    # it is a process that just started, so its baseline is 0 and
+                    # the GPU time it has accrued since launch belongs to this
+                    # interval. Skipping it instead (as we used to) hid every new
+                    # GPU process for a full interval.
+                    base = 0
+                else:
+                    # First snapshot ever: we know nothing about this pid's past,
+                    # so a 0 baseline would credit its whole lifetime to one
+                    # interval -- WindowServer would report ~17,000,000 ms/s.
+                    continue
+                dns = ns2 - base
+                if dns > 0:
+                    rows.append({"pid": pid, "name": name,
+                                 "gpu_ms_s": dns / 1e6 / elapsed})
         self.prev = snap
         self.prev_time = now
+        self.started = True
         rows.sort(key=lambda r: r["gpu_ms_s"], reverse=True)
         return rows
 

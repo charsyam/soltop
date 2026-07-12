@@ -372,6 +372,55 @@ class CoreViewTests(unittest.TestCase):
         self.assertIn(soltop.bracket_gauge(0.0, 90 - 10 - 32), frame)
 
 
+class ProcGPUSamplerTests(unittest.TestCase):
+    """step() diffs accumulated per-pid GPU time against the previous snapshot."""
+
+    def _sampler(self, snapshots):
+        ps = soltop.ProcGPUSampler()
+        self._snaps = list(snapshots)
+        return ps
+
+    def test_a_newly_started_process_appears_on_the_next_sample(self):
+        # `if pid in self.prev` skipped any pid absent from the previous
+        # snapshot, so a process that launched after the baseline was invisible
+        # for a whole interval. Its baseline is 0 -- it did not exist before.
+        ps = soltop.ProcGPUSampler()
+        snaps = [
+            {1: ("old", 5_000_000_000)},                       # baseline
+            {1: ("old", 5_000_000_000), 42: ("new", 500_000_000)},
+        ]
+        with unittest.mock.patch.object(soltop, "_gpu_client_totals",
+                                        side_effect=snaps):
+            ps.step()                       # baseline
+            ps.prev_time -= 1.0             # pretend 1s elapsed
+            rows = ps.step()
+        pids = {r["pid"] for r in rows}
+        self.assertIn(42, pids, "a process that just started must be reported")
+        row = next(r for r in rows if r["pid"] == 42)
+        self.assertAlmostEqual(row["gpu_ms_s"], 500.0, places=1)
+
+    def test_first_snapshot_reports_nothing(self):
+        # With no prior snapshot we know nothing about a pid's past, so a zero
+        # baseline would credit its entire lifetime to one interval (WindowServer
+        # would read ~17,000,000 ms/s).
+        ps = soltop.ProcGPUSampler()
+        with unittest.mock.patch.object(
+                soltop, "_gpu_client_totals",
+                return_value={1: ("WindowServer", 17_000_000_000_000)}):
+            self.assertEqual(ps.step(), [])
+
+    def test_a_long_lived_process_never_reports_its_lifetime_total(self):
+        ps = soltop.ProcGPUSampler()
+        huge = 17_000_000_000_000
+        snaps = [{1: ("WindowServer", huge)}, {1: ("WindowServer", huge + 10_000_000)}]
+        with unittest.mock.patch.object(soltop, "_gpu_client_totals",
+                                        side_effect=snaps):
+            ps.step()
+            ps.prev_time -= 1.0
+            rows = ps.step()
+        self.assertAlmostEqual(rows[0]["gpu_ms_s"], 10.0, places=1)
+
+
 class SamplerLifecycleTests(unittest.TestCase):
     def test_failed_resubscribe_closes_instead_of_leaving_a_zombie(self):
         # _release() nulls every pointer, so if build_subscription() then raises,
@@ -491,7 +540,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.5.7")
+        self.assertEqual(soltop.__version__, "0.5.8")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200
