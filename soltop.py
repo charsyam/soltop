@@ -5,12 +5,13 @@ Computes GPU/CPU active utilization from P-State residency on Apple Silicon.
 """
 import ctypes
 import ctypes.util
+import datetime
 import re
 import subprocess
 import time
 from collections import deque
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 from ctypes import (
     c_void_p,
@@ -796,6 +797,14 @@ class ProcGPUSampler:
         self.prev = {}       # pid -> (name, accumulated_ns, last_submitted_ns)
         self.prev_time = None
         self.started = False  # have we taken a baseline snapshot yet?
+        # (pid, name, last_submitted_ns) -> wall-clock time of that submission.
+        # Pin each submission to the wall clock ONCE, the first time we see it,
+        # and reuse it forever after. Recomputing `now - age` every frame would
+        # let the displayed time drift: mach_absolute_time stops while the
+        # machine sleeps, so after a suspend the same submission would suddenly
+        # appear to have happened later than it did. The mach timestamp is in the
+        # key, so a *new* submission by the same process gets a fresh wall time.
+        self._wall_cache = {}
 
     def read(self, interval=1.0):
         self.prev = _gpu_client_totals()
@@ -815,8 +824,13 @@ class ProcGPUSampler:
         snap = _gpu_client_totals()
         now = time.monotonic()
         now_ns = mach_now_ns()
+        now_wall = time.time()
         elapsed = (now - self.prev_time) if self.prev_time is not None else 0.0
         rows = []
+        # Rebuilt from scratch each step and swapped in below, so entries for
+        # dead processes and superseded submissions fall out instead of the cache
+        # growing without bound (an active process gets a new key every frame).
+        fresh_cache = {}
         if elapsed > 0:
             for pid, (name, ns2, last_ns) in snap.items():
                 if pid in self.prev:
@@ -842,12 +856,21 @@ class ProcGPUSampler:
                     # The driver may stamp lastSubmittedTime a hair after we read
                     # the clock, so clamp the tiny negative that produces to 0.
                     idle = max(0.0, (now_ns - last_ns) / 1e9) if last_ns else None
+                    wall = None
+                    if idle is not None:
+                        # Pin this submission to the wall clock once, then reuse.
+                        key = (pid, name, last_ns)
+                        wall = self._wall_cache.get(key)
+                        if wall is None:
+                            wall = now_wall - idle
+                        fresh_cache[key] = wall
                     rows.append({"pid": pid, "name": name,
                                  "gpu_ms_s": dns / 1e6 / elapsed,
-                                 "last_s": idle})
+                                 "last_s": idle, "last_wall": wall})
         self.prev = snap
         self.prev_time = now
         self.started = True
+        self._wall_cache = fresh_cache
         _attach_proc_stats(rows)
         # Busiest first; among the idle ones, most recently active first.
         rows.sort(key=lambda r: (r["gpu_ms_s"],
@@ -865,17 +888,18 @@ def _fmt_bytes(n):
     return f"{n / (1 << 20):.0f}M"
 
 
-def _fmt_age(seconds):
-    """How long ago the process last submitted GPU work."""
-    if seconds is None:
+def _fmt_last(wall):
+    """Local wall-clock time of the last GPU submission: '22:48:08'.
+
+    Older than a day, the time of day alone would be ambiguous, so show the date
+    instead.
+    """
+    if not wall:
         return "-"
-    if seconds < 1:
-        return "now"
-    if seconds < 60:
-        return f"{seconds:.0f}s"
-    if seconds < 3600:
-        return f"{seconds / 60:.0f}m"
-    return f"{seconds / 3600:.0f}h"
+    t = datetime.datetime.fromtimestamp(wall)
+    if time.time() - wall >= 86400:
+        return t.strftime("%m/%d")
+    return t.strftime("%H:%M:%S")
 
 
 def render_procs(rows, limit=10):
@@ -890,14 +914,14 @@ def render_procs(rows, limit=10):
         lines.append("  \x1b[2m(no GPU activity)\x1b[0m")
         return lines
     lines.append(f"  {'PID':>7}  {'GPU ms/s':>9}  {'GPU%':>5}  {'CPU%':>6}"
-                 f"  {'MEM':>6}  {'LAST':>5}  NAME")
+                 f"  {'MEM':>6}  {'LAST':>8}  NAME")
     for r in rows[:limit]:
         pct = min(100.0, r["gpu_ms_s"] / 10.0)   # 1000 ms/s == 100%
         cpu = r.get("cpu_pct")
         cpu_s = f"{cpu:.1f}" if cpu is not None else "-"
         lines.append(f"  {r['pid']:>7}  {r['gpu_ms_s']:>9.1f}  {pct:>5.1f}"
                      f"  {cpu_s:>6}  {_fmt_bytes(r.get('rss_bytes')):>6}"
-                     f"  {_fmt_age(r.get('last_s')):>5}  {r['name']}")
+                     f"  {_fmt_last(r.get('last_wall')):>8}  {r['name']}")
     return lines
 
 

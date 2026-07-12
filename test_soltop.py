@@ -1,6 +1,8 @@
+import datetime
 import io
 import subprocess
 import sys
+import time
 import unittest
 import unittest.mock
 
@@ -431,13 +433,76 @@ class ProcGPUSamplerTests(unittest.TestCase):
         self.assertEqual(rows[1]["gpu_ms_s"], 0.0)
 
 
+class LastSubmittedCacheTests(unittest.TestCase):
+    """A submission's wall-clock time is pinned once and reused.
+
+    Recomputing `now - age` every frame would let it drift: mach_absolute_time
+    stops while the machine sleeps, so after a suspend the same submission would
+    suddenly appear to have happened later than it did.
+    """
+
+    def _rows_over_time(self, snaps):
+        ps = soltop.ProcGPUSampler()
+        out = []
+        with unittest.mock.patch.object(soltop, "_gpu_client_totals",
+                                        side_effect=snaps), \
+                unittest.mock.patch.object(soltop, "_attach_proc_stats",
+                                           lambda rows: None):
+            for _ in snaps:
+                if ps.prev_time is not None:
+                    ps.prev_time -= 1.0
+                out.append(ps.step())
+        return out
+
+    def test_an_unchanged_submission_keeps_the_same_wall_time(self):
+        last = 1_000_000_000
+        snaps = [{7: ("idle", 500, last)}] * 4
+        runs = self._rows_over_time(snaps)
+        walls = {r[0]["last_wall"] for r in runs[1:] if r}
+        self.assertEqual(len(walls), 1, f"wall time drifted across frames: {walls}")
+
+    def test_a_new_submission_gets_a_fresh_wall_time(self):
+        # The mach timestamp is part of the cache key, so a genuinely new
+        # submission must not reuse the old pinned time.
+        snaps = [
+            {7: ("app", 500, 1_000_000_000)},
+            {7: ("app", 500, 1_000_000_000)},
+            {7: ("app", 500, 9_000_000_000)},   # submitted again
+        ]
+        runs = self._rows_over_time(snaps)
+        first = runs[1][0]["last_wall"]
+        after = runs[2][0]["last_wall"]
+        self.assertNotEqual(first, after)
+
+    def test_the_cache_does_not_grow_without_bound(self):
+        # An active process gets a new key every frame, so the cache must be
+        # rebuilt each step rather than accumulating every submission ever seen.
+        snaps = [{7: ("busy", 500 + i, 1_000_000_000 + i)} for i in range(30)]
+        ps = soltop.ProcGPUSampler()
+        with unittest.mock.patch.object(soltop, "_gpu_client_totals",
+                                        side_effect=snaps), \
+                unittest.mock.patch.object(soltop, "_attach_proc_stats",
+                                           lambda rows: None):
+            for _ in snaps:
+                if ps.prev_time is not None:
+                    ps.prev_time -= 1.0
+                ps.step()
+        self.assertLessEqual(len(ps._wall_cache), 1)
+
+
 class ProcTableFormattingTests(unittest.TestCase):
-    def test_fmt_age(self):
-        self.assertEqual(soltop._fmt_age(None), "-")
-        self.assertEqual(soltop._fmt_age(0.2), "now")
-        self.assertEqual(soltop._fmt_age(45), "45s")
-        self.assertEqual(soltop._fmt_age(120), "2m")
-        self.assertEqual(soltop._fmt_age(7200), "2h")
+    def test_fmt_last_shows_local_wall_clock_time(self):
+        self.assertEqual(soltop._fmt_last(None), "-")
+        self.assertEqual(soltop._fmt_last(0), "-")
+        # A submission a minute ago shows as a local time of day.
+        t = time.time() - 60
+        want = datetime.datetime.fromtimestamp(t).strftime("%H:%M:%S")
+        self.assertEqual(soltop._fmt_last(t), want)
+
+    def test_fmt_last_shows_a_date_once_it_is_over_a_day_old(self):
+        # A bare time of day would be ambiguous for something two days back.
+        old = time.time() - 2 * 86400
+        self.assertRegex(soltop._fmt_last(old), r"^\d{2}/\d{2}$")
 
     def test_fmt_bytes(self):
         self.assertEqual(soltop._fmt_bytes(None), "-")
@@ -445,15 +510,20 @@ class ProcTableFormattingTests(unittest.TestCase):
         self.assertEqual(soltop._fmt_bytes(3 << 30), "3.0G")
 
     def test_table_shows_gpu_cpu_mem_and_last(self):
-        rows = [{"pid": 42, "name": "app", "gpu_ms_s": 500.0, "last_s": 0.0,
+        now = time.time()
+        rows = [{"pid": 42, "name": "app", "gpu_ms_s": 500.0,
+                 "last_s": 0.0, "last_wall": now,
                  "cpu_pct": 12.5, "rss_bytes": 331 << 20}]
         out = "\n".join(soltop.render_procs(rows))
-        for want in ("GPU%", "CPU%", "MEM", "LAST", "12.5", "331M", "now"):
+        clock = datetime.datetime.fromtimestamp(now).strftime("%H:%M:%S")
+        for want in ("GPU%", "CPU%", "MEM", "LAST", "12.5", "331M", clock):
             self.assertIn(want, out)
 
-    def test_table_tolerates_missing_cpu_and_memory(self):
-        # _attach_proc_stats is best-effort; a row may carry no cpu/rss at all.
-        rows = [{"pid": 42, "name": "app", "gpu_ms_s": 1.0, "last_s": None}]
+    def test_table_tolerates_missing_cpu_memory_and_last(self):
+        # _attach_proc_stats is best-effort, and a client may have never
+        # submitted, so a row may carry none of these.
+        rows = [{"pid": 42, "name": "app", "gpu_ms_s": 1.0,
+                 "last_s": None, "last_wall": None}]
         out = "\n".join(soltop.render_procs(rows))
         self.assertIn("app", out)
 
@@ -577,7 +647,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.6.0")
+        self.assertEqual(soltop.__version__, "0.6.1")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200
