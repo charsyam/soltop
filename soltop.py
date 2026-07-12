@@ -9,7 +9,7 @@ import re
 import time
 from collections import deque
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 from ctypes import (
     c_void_p,
@@ -1110,9 +1110,11 @@ def render_cores(view, width, limit=None):
     same data broken out per core, so a single pegged core is visible instead of
     being averaged away.
     """
-    # Leave room for the name, the "100.00%" column and the "@ 100% DVFS" suffix,
-    # or the bar would push them past the border and they'd be truncated away.
-    bw = max(8, width - 30)
+    # Same gauge as the dashboard's cluster bars (gauge_bar, in brackets), so the
+    # two views read as one UI. Leave room for the name, the "100.00%" column and
+    # the "@ 100% DVFS" suffix, or the bar pushes them past the border and
+    # wrap_box() truncates them away.
+    bw = max(8, width - 32)
     lines = []
     for c in view.get("clusters", []):
         if limit is not None and len(lines) >= limit:
@@ -1125,8 +1127,8 @@ def render_cores(view, width, limit=None):
                 break
             cf = _freq_txt(core.get("mhz", 0.0), core.get("freq_unit", "MHz"))
             pct = core["pct"]
-            lines.append("  %-8s %s %6.2f%%  %s"
-                         % (core["name"], bar(pct, bw), pct, cf))
+            lines.append("  %-8s [%s] %6.2f%%  %s"
+                         % (core["name"], gauge_bar(pct / 100, bw), pct, cf))
         lines.append("")
     if lines and lines[-1] == "":
         lines.pop()
