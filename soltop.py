@@ -9,7 +9,7 @@ import re
 import time
 from collections import deque
 
-__version__ = "0.5.6"
+__version__ = "0.5.7"
 
 from ctypes import (
     c_void_p,
@@ -1316,6 +1316,12 @@ class KeyReader:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.attrs)
 
 
+# Consecutive Sampler rebuilds live() will attempt before giving up. A transient
+# IOReport failure recovers on the first retry; anything that fails this many
+# times running is not transient, and spinning on it forever helps nobody.
+LIVE_MAX_RETRIES = 3
+
+
 def live(interval=1.0, cols_override=None):
     import sys
 
@@ -1329,18 +1335,27 @@ def live(interval=1.0, cols_override=None):
     last_size = None
     process_only = False
     core_only = False
+    retries = 0
     try:
         with KeyReader(sys.stdin) as keys:
             while True:
                 try:
                     view = organize(sampler.read(interval))
+                    retries = 0
                 except RuntimeError:
-                    # read() now closes the Sampler and raises when IOReport
-                    # keeps failing, so a transient hiccup would otherwise kill
-                    # the monitor with a traceback. Rebuild and carry on; if the
-                    # rebuild fails too, the error is real and propagates.
+                    # read() closes the Sampler and raises when IOReport keeps
+                    # failing, so without this a transient hiccup would kill the
+                    # monitor with a traceback. Rebuild and carry on -- but only
+                    # a bounded number of times in a row: retrying forever would
+                    # spin, rebuilding a subscription (an IOReportCopyAllChannels
+                    # scan over ~11k channels) several times a second behind a
+                    # frozen screen, with the user told nothing.
+                    retries += 1
+                    if retries > LIVE_MAX_RETRIES:
+                        raise
                     sampler.close()
                     sampler = Sampler()
+                    time.sleep(interval)     # don't hot-spin while it's broken
                     continue
                 gpu_hist.append(view["gpu_pct"])
                 soc_hist.append(view.get("power", {}).get("SoC", 0) / 1000)
@@ -1404,28 +1419,36 @@ def main():
     args = p.parse_args()
     cols_override = args.cols or None
 
-    if args.once:
-        sampler = Sampler()
-        try:
+    # IOReport can refuse to subscribe (unsupported machine, or it simply keeps
+    # failing). Report that as a message, not a Python traceback.
+    try:
+        if args.once:
+            sampler = Sampler()
             try:
-                proc_sampler = ProcGPUSampler()
-                proc_sampler.step()  # establish the process baseline before the wait
-            except Exception:
-                proc_sampler = None
-            view = organize(sampler.read(args.interval))
-            try:
-                procs = proc_sampler.step() if proc_sampler else []
-            except Exception:
-                procs = []
-            tcols, rows = term_size()
-            # One sample: no history worth graphing, and no meaningful avg/peak.
-            print(render(view, cols_override or tcols, gpu_hist=None, procs=procs,
-                         height=rows, soc_hist=None, single_sample=True))
-        finally:
-            sampler.close()
-    else:
-        live(args.interval, cols_override)
+                try:
+                    proc_sampler = ProcGPUSampler()
+                    proc_sampler.step()  # establish the process baseline before the wait
+                except Exception:
+                    proc_sampler = None
+                view = organize(sampler.read(args.interval))
+                try:
+                    procs = proc_sampler.step() if proc_sampler else []
+                except Exception:
+                    procs = []
+                tcols, rows = term_size()
+                # One sample: no history worth graphing, and no meaningful avg/peak.
+                print(render(view, cols_override or tcols, gpu_hist=None, procs=procs,
+                             height=rows, soc_hist=None, single_sample=True))
+            finally:
+                sampler.close()
+        else:
+            live(args.interval, cols_override)
+    except RuntimeError as e:
+        import sys
+        print(f"soltop: {e}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

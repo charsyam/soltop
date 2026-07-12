@@ -140,6 +140,47 @@ class LiveRecoveryTests(unittest.TestCase):
         self.assertGreater(calls["n"], 2, "should have sampled past the failure")
 
 
+    def test_live_gives_up_instead_of_spinning_on_a_persistent_failure(self):
+        # Retrying forever would rebuild the subscription (an
+        # IOReportCopyAllChannels scan over ~11k channels) several times a second
+        # behind a frozen screen, forever, telling the user nothing. Bound it.
+        calls = {"n": 0}
+
+        def always_fail(sampler, interval=1.0):
+            calls["n"] += 1
+            sampler.close()
+            raise RuntimeError("samples failed")
+
+        class Keys:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read_available(self):
+                return ""
+
+        with unittest.mock.patch.object(soltop.Sampler, "read", always_fail), \
+                unittest.mock.patch.object(soltop, "KeyReader", lambda s: Keys()), \
+                unittest.mock.patch.object(soltop.time, "sleep", lambda s: None), \
+                unittest.mock.patch("sys.stdout", new_callable=io.StringIO):
+            with self.assertRaises(RuntimeError):
+                soltop.live(interval=0.01)
+        self.assertLessEqual(calls["n"], soltop.LIVE_MAX_RETRIES + 1)
+
+    def test_main_reports_a_sampler_failure_without_a_traceback(self):
+        def boom(*a, **k):
+            raise RuntimeError("subscription failed")
+
+        err = io.StringIO()
+        with unittest.mock.patch.object(soltop, "Sampler", boom), \
+                unittest.mock.patch.object(sys, "argv", ["soltop", "--once"]), \
+                unittest.mock.patch.object(sys, "stderr", err):
+            self.assertEqual(soltop.main(), 1)
+        self.assertIn("subscription failed", err.getvalue())
+
+
 class ChannelSelectionTests(unittest.TestCase):
     """The GPU/CPU subgroups we subscribe to decide whether the numbers mean
     anything. 'GPU Stats' also exposes latched status registers (Fender State,
@@ -450,7 +491,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.5.6")
+        self.assertEqual(soltop.__version__, "0.5.7")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200
