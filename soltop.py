@@ -5,13 +5,12 @@ Computes GPU/CPU active utilization from P-State residency on Apple Silicon.
 """
 import ctypes
 import ctypes.util
-import datetime
 import re
 import subprocess
 import time
 from collections import deque
 
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 
 from ctypes import (
     c_void_p,
@@ -665,27 +664,6 @@ GPU_CLIENT_CLASSES = (b"AGXDeviceUserClient", b"IOGPUDeviceUserClient")
 _K_CREATOR = cfstr("IOUserClientCreator")
 _K_APPUSAGE = cfstr("AppUsage")
 _K_GPUTIME = cfstr("accumulatedGPUTime")
-_K_LASTSUBMIT = cfstr("lastSubmittedTime")
-
-
-# lastSubmittedTime is in nanoseconds on the mach_absolute_time clock, so
-# "how long since this process last submitted GPU work" needs that clock in the
-# same unit. (Comparing against raw mach ticks instead of nanoseconds yields
-# nonsense -- the raw counter runs ~40x slower than ns on this timebase.)
-_libc.mach_absolute_time.restype = c_uint64
-
-
-class _MachTimebase(ctypes.Structure):
-    _fields_ = [("numer", c_uint32), ("denom", c_uint32)]
-
-
-_TIMEBASE = _MachTimebase()
-_libc.mach_timebase_info(byref(_TIMEBASE))
-
-
-def mach_now_ns():
-    """Current mach_absolute_time, in nanoseconds."""
-    return _libc.mach_absolute_time() * _TIMEBASE.numer // _TIMEBASE.denom
 
 
 def _cfnum_i64(ref):
@@ -710,11 +688,7 @@ def _parse_creator(s):
 
 
 def _gpu_client_totals():
-    """Return {pid: (name, accumulated_gpu_ns, last_submitted_ns)}.
-
-    accumulated_gpu_ns is summed over all of the pid's command queues;
-    last_submitted_ns is the most recent submission across them (nanoseconds on
-    the mach_absolute_time clock -- see mach_now_ns()).
+    """Return {pid: (name, accumulated_gpu_ns)} summed over all command queues.
 
     User clients are !registered/!matched, so IOServiceGetMatchingServices does
     not find them. We walk the IOService plane recursively and filter by class.
@@ -740,13 +714,11 @@ def _gpu_client_totals():
             usage = CF.CFDictionaryGetValue(props, _K_APPUSAGE)
             if pid is not None and usage:
                 ns = 0
-                last = 0
                 for i in range(CF.CFArrayGetCount(usage)):
                     q = CF.CFArrayGetValueAtIndex(usage, i)
                     ns += _cfnum_i64(CF.CFDictionaryGetValue(q, _K_GPUTIME))
-                    last = max(last, _cfnum_i64(CF.CFDictionaryGetValue(q, _K_LASTSUBMIT)))
-                prev = totals.get(pid, (name, 0, 0))
-                totals[pid] = (name or prev[0], prev[1] + ns, max(prev[2], last))
+                prev = totals.get(pid, (name, 0))
+                totals[pid] = (name or prev[0], prev[1] + ns)
             CF.CFRelease(props)
         finally:
             IOKIT.IOObjectRelease(obj)
@@ -806,17 +778,9 @@ class ProcGPUSampler:
     """
 
     def __init__(self):
-        self.prev = {}       # pid -> (name, accumulated_ns, last_submitted_ns)
+        self.prev = {}       # pid -> (name, accumulated_ns)
         self.prev_time = None
         self.started = False  # have we taken a baseline snapshot yet?
-        # (pid, name, last_submitted_ns) -> wall-clock time of that submission.
-        # Pin each submission to the wall clock ONCE, the first time we see it,
-        # and reuse it forever after. Recomputing `now - age` every frame would
-        # let the displayed time drift: mach_absolute_time stops while the
-        # machine sleeps, so after a suspend the same submission would suddenly
-        # appear to have happened later than it did. The mach timestamp is in the
-        # key, so a *new* submission by the same process gets a fresh wall time.
-        self._wall_cache = {}
 
     def read(self, interval=1.0):
         self.prev = _gpu_client_totals()
@@ -835,16 +799,10 @@ class ProcGPUSampler:
         """
         snap = _gpu_client_totals()
         now = time.monotonic()
-        now_ns = mach_now_ns()
-        now_wall = time.time()
         elapsed = (now - self.prev_time) if self.prev_time is not None else 0.0
         rows = []
-        # Rebuilt from scratch each step and swapped in below, so entries for
-        # dead processes and superseded submissions fall out instead of the cache
-        # growing without bound (an active process gets a new key every frame).
-        fresh_cache = {}
         if elapsed > 0:
-            for pid, (name, ns2, last_ns) in snap.items():
+            for pid, (name, ns2) in snap.items():
                 if pid in self.prev:
                     base = self.prev[pid][1]
                 elif self.started:
@@ -860,37 +818,15 @@ class ProcGPUSampler:
                     # interval -- WindowServer would report ~17,000,000 ms/s.
                     continue
                 dns = ns2 - base
-                # Idle clients (dns == 0) are listed too, below the busy ones.
-                # They still hold a GPU context, and it is exactly for them that
-                # LAST is informative -- a process busy in THIS interval has by
-                # definition just submitted, so its LAST is always "now".
-                if dns >= 0:
-                    # The driver may stamp lastSubmittedTime a hair after we read
-                    # the clock, so clamp the tiny negative that produces to 0.
-                    idle = max(0.0, (now_ns - last_ns) / 1e9) if last_ns else None
-                    wall = None
-                    if idle is not None:
-                        # Pin this submission to the wall clock once, then reuse.
-                        key = (pid, name, last_ns)
-                        wall = self._wall_cache.get(key)
-                        if wall is None:
-                            wall = now_wall - idle
-                        fresh_cache[key] = wall
+                if dns > 0:
                     rows.append({"pid": pid, "name": name,
-                                 "gpu_ms_s": dns / 1e6 / elapsed,
-                                 "last_s": idle, "last_wall": wall})
+                                 "gpu_ms_s": dns / 1e6 / elapsed})
         self.prev = snap
         self.prev_time = now
         self.started = True
-        self._wall_cache = fresh_cache
-        # Busiest first; among the idle ones, most recently active first.
-        rows.sort(key=lambda r: (r["gpu_ms_s"],
-                                 -(r["last_s"] if r["last_s"] is not None else 1e9)),
-                  reverse=True)
-        # Sort BEFORE looking up cpu/memory, and only look them up for the rows a
-        # caller could plausibly display. Since idle GPU clients are listed too,
-        # every frame carried ~70 pids while at most a dozen are ever on screen --
-        # a `ps` over all of them cost ~31ms per frame for nothing.
+        rows.sort(key=lambda r: r["gpu_ms_s"], reverse=True)
+        # Sort first, then look up cpu/memory only for rows a caller could
+        # plausibly display.
         _attach_proc_stats(rows[:PROC_STATS_LIMIT])
         return rows
 
@@ -909,40 +845,25 @@ def _fmt_bytes(n):
     return f"{n / (1 << 20):.0f}M"
 
 
-def _fmt_last(wall):
-    """Local wall-clock time of the last GPU submission: '22:48:08'.
-
-    Older than a day, the time of day alone would be ambiguous, so show the date
-    instead.
-    """
-    if not wall:
-        return "-"
-    t = datetime.datetime.fromtimestamp(wall)
-    if time.time() - wall >= 86400:
-        return t.strftime("%m/%d")
-    return t.strftime("%H:%M:%S")
-
-
 def render_procs(rows, limit=10):
     """Render a per-process GPU table (like nvidia-smi's process list).
 
     MEM is the process's RSS: Apple Silicon memory is unified, so that is the
     memory it costs the SoC -- the GPU driver publishes no separate VRAM figure.
-    LAST is how long ago it last submitted GPU work.
     """
     lines = [f"{HEADER} GPU processes{RESET}"]
     if not rows:
         lines.append("  \x1b[2m(no GPU activity)\x1b[0m")
         return lines
     lines.append(f"  {'PID':>7}  {'GPU ms/s':>9}  {'GPU%':>5}  {'CPU%':>6}"
-                 f"  {'MEM':>6}  {'LAST':>8}  NAME")
+                 f"  {'MEM':>6}  NAME")
     for r in rows[:limit]:
         pct = min(100.0, r["gpu_ms_s"] / 10.0)   # 1000 ms/s == 100%
         cpu = r.get("cpu_pct")
         cpu_s = f"{cpu:.1f}" if cpu is not None else "-"
         lines.append(f"  {r['pid']:>7}  {r['gpu_ms_s']:>9.1f}  {pct:>5.1f}"
                      f"  {cpu_s:>6}  {_fmt_bytes(r.get('rss_bytes')):>6}"
-                     f"  {_fmt_last(r.get('last_wall')):>8}  {r['name']}")
+                     f"  {r['name']}")
     return lines
 
 
