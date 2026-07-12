@@ -380,22 +380,25 @@ class ProcGPUSamplerTests(unittest.TestCase):
         self._snaps = list(snapshots)
         return ps
 
+    def _step_twice(self, snaps):
+        """Run two steps over canned snapshots with 1s of simulated elapsed."""
+        ps = soltop.ProcGPUSampler()
+        with unittest.mock.patch.object(soltop, "_gpu_client_totals",
+                                        side_effect=snaps), \
+                unittest.mock.patch.object(soltop, "_attach_proc_stats",
+                                           lambda rows: None):
+            ps.step()                       # baseline
+            ps.prev_time -= 1.0             # pretend 1s elapsed
+            return ps.step()
+
     def test_a_newly_started_process_appears_on_the_next_sample(self):
         # `if pid in self.prev` skipped any pid absent from the previous
         # snapshot, so a process that launched after the baseline was invisible
         # for a whole interval. Its baseline is 0 -- it did not exist before.
-        ps = soltop.ProcGPUSampler()
-        snaps = [
-            {1: ("old", 5_000_000_000)},                       # baseline
-            {1: ("old", 5_000_000_000), 42: ("new", 500_000_000)},
-        ]
-        with unittest.mock.patch.object(soltop, "_gpu_client_totals",
-                                        side_effect=snaps):
-            ps.step()                       # baseline
-            ps.prev_time -= 1.0             # pretend 1s elapsed
-            rows = ps.step()
-        pids = {r["pid"] for r in rows}
-        self.assertIn(42, pids, "a process that just started must be reported")
+        rows = self._step_twice([
+            {1: ("old", 5_000_000_000, 0)},
+            {1: ("old", 5_000_000_000, 0), 42: ("new", 500_000_000, 0)},
+        ])
         row = next(r for r in rows if r["pid"] == 42)
         self.assertAlmostEqual(row["gpu_ms_s"], 500.0, places=1)
 
@@ -406,19 +409,53 @@ class ProcGPUSamplerTests(unittest.TestCase):
         ps = soltop.ProcGPUSampler()
         with unittest.mock.patch.object(
                 soltop, "_gpu_client_totals",
-                return_value={1: ("WindowServer", 17_000_000_000_000)}):
+                return_value={1: ("WindowServer", 17_000_000_000_000, 0)}):
             self.assertEqual(ps.step(), [])
 
     def test_a_long_lived_process_never_reports_its_lifetime_total(self):
-        ps = soltop.ProcGPUSampler()
         huge = 17_000_000_000_000
-        snaps = [{1: ("WindowServer", huge)}, {1: ("WindowServer", huge + 10_000_000)}]
-        with unittest.mock.patch.object(soltop, "_gpu_client_totals",
-                                        side_effect=snaps):
-            ps.step()
-            ps.prev_time -= 1.0
-            rows = ps.step()
+        rows = self._step_twice([{1: ("WindowServer", huge, 0)},
+                                 {1: ("WindowServer", huge + 10_000_000, 0)}])
         self.assertAlmostEqual(rows[0]["gpu_ms_s"], 10.0, places=1)
+
+    def test_idle_gpu_clients_are_listed_below_the_busy_ones(self):
+        # An idle client still holds a GPU context, and it is exactly for those
+        # that LAST is informative: a process busy in THIS interval has by
+        # definition just submitted, so its LAST is always "now".
+        busy = 5_000_000_000
+        rows = self._step_twice([
+            {1: ("busy", busy, 0), 2: ("idle", 900, 0)},
+            {1: ("busy", busy + 10_000_000, 0), 2: ("idle", 900, 0)},
+        ])
+        self.assertEqual([r["name"] for r in rows], ["busy", "idle"])
+        self.assertEqual(rows[1]["gpu_ms_s"], 0.0)
+
+
+class ProcTableFormattingTests(unittest.TestCase):
+    def test_fmt_age(self):
+        self.assertEqual(soltop._fmt_age(None), "-")
+        self.assertEqual(soltop._fmt_age(0.2), "now")
+        self.assertEqual(soltop._fmt_age(45), "45s")
+        self.assertEqual(soltop._fmt_age(120), "2m")
+        self.assertEqual(soltop._fmt_age(7200), "2h")
+
+    def test_fmt_bytes(self):
+        self.assertEqual(soltop._fmt_bytes(None), "-")
+        self.assertEqual(soltop._fmt_bytes(331 << 20), "331M")
+        self.assertEqual(soltop._fmt_bytes(3 << 30), "3.0G")
+
+    def test_table_shows_gpu_cpu_mem_and_last(self):
+        rows = [{"pid": 42, "name": "app", "gpu_ms_s": 500.0, "last_s": 0.0,
+                 "cpu_pct": 12.5, "rss_bytes": 331 << 20}]
+        out = "\n".join(soltop.render_procs(rows))
+        for want in ("GPU%", "CPU%", "MEM", "LAST", "12.5", "331M", "now"):
+            self.assertIn(want, out)
+
+    def test_table_tolerates_missing_cpu_and_memory(self):
+        # _attach_proc_stats is best-effort; a row may carry no cpu/rss at all.
+        rows = [{"pid": 42, "name": "app", "gpu_ms_s": 1.0, "last_s": None}]
+        out = "\n".join(soltop.render_procs(rows))
+        self.assertIn("app", out)
 
 
 class SamplerLifecycleTests(unittest.TestCase):
@@ -540,7 +577,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0, "MHz"), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.5.8")
+        self.assertEqual(soltop.__version__, "0.6.0")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200

@@ -6,10 +6,11 @@ Computes GPU/CPU active utilization from P-State residency on Apple Silicon.
 import ctypes
 import ctypes.util
 import re
+import subprocess
 import time
 from collections import deque
 
-__version__ = "0.5.8"
+__version__ = "0.6.0"
 
 from ctypes import (
     c_void_p,
@@ -26,6 +27,7 @@ from ctypes import (
 
 CF = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
 IOR = ctypes.CDLL("/usr/lib/libIOReport.dylib")
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
 kCFStringEncodingUTF8 = 0x08000100
 
@@ -662,6 +664,27 @@ GPU_CLIENT_CLASSES = (b"AGXDeviceUserClient", b"IOGPUDeviceUserClient")
 _K_CREATOR = cfstr("IOUserClientCreator")
 _K_APPUSAGE = cfstr("AppUsage")
 _K_GPUTIME = cfstr("accumulatedGPUTime")
+_K_LASTSUBMIT = cfstr("lastSubmittedTime")
+
+
+# lastSubmittedTime is in nanoseconds on the mach_absolute_time clock, so
+# "how long since this process last submitted GPU work" needs that clock in the
+# same unit. (Comparing against raw mach ticks instead of nanoseconds yields
+# nonsense -- the raw counter runs ~40x slower than ns on this timebase.)
+_libc.mach_absolute_time.restype = c_uint64
+
+
+class _MachTimebase(ctypes.Structure):
+    _fields_ = [("numer", c_uint32), ("denom", c_uint32)]
+
+
+_TIMEBASE = _MachTimebase()
+_libc.mach_timebase_info(byref(_TIMEBASE))
+
+
+def mach_now_ns():
+    """Current mach_absolute_time, in nanoseconds."""
+    return _libc.mach_absolute_time() * _TIMEBASE.numer // _TIMEBASE.denom
 
 
 def _cfnum_i64(ref):
@@ -686,7 +709,11 @@ def _parse_creator(s):
 
 
 def _gpu_client_totals():
-    """Return {pid: (name, accumulated_gpu_ns)} summed over all command queues.
+    """Return {pid: (name, accumulated_gpu_ns, last_submitted_ns)}.
+
+    accumulated_gpu_ns is summed over all of the pid's command queues;
+    last_submitted_ns is the most recent submission across them (nanoseconds on
+    the mach_absolute_time clock -- see mach_now_ns()).
 
     User clients are !registered/!matched, so IOServiceGetMatchingServices does
     not find them. We walk the IOService plane recursively and filter by class.
@@ -712,16 +739,51 @@ def _gpu_client_totals():
             usage = CF.CFDictionaryGetValue(props, _K_APPUSAGE)
             if pid is not None and usage:
                 ns = 0
+                last = 0
                 for i in range(CF.CFArrayGetCount(usage)):
                     q = CF.CFArrayGetValueAtIndex(usage, i)
                     ns += _cfnum_i64(CF.CFDictionaryGetValue(q, _K_GPUTIME))
-                prev = totals.get(pid, (name, 0))
-                totals[pid] = (name or prev[0], prev[1] + ns)
+                    last = max(last, _cfnum_i64(CF.CFDictionaryGetValue(q, _K_LASTSUBMIT)))
+                prev = totals.get(pid, (name, 0, 0))
+                totals[pid] = (name or prev[0], prev[1] + ns, max(prev[2], last))
             CF.CFRelease(props)
         finally:
             IOKIT.IOObjectRelease(obj)
     IOKIT.IOObjectRelease(it)
     return totals
+
+
+def _attach_proc_stats(rows):
+    """Fill in each row's cpu_pct and rss_bytes, in one `ps` call for all pids.
+
+    The GPU driver publishes only API / accumulatedGPUTime / lastSubmittedTime
+    per client -- no memory figure -- so CPU and memory come from the process
+    itself. On Apple Silicon memory is unified, so a process's RSS *is* the
+    memory it is costing the SoC; there is no separate VRAM number to report.
+
+    Best-effort: on any failure the fields are simply left as None.
+    """
+    if not rows:
+        return
+    pids = ",".join(str(r["pid"]) for r in rows)
+    try:
+        out = subprocess.run(["ps", "-o", "pid=,%cpu=,rss=", "-p", pids],
+                             capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        return
+    stats = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        try:
+            stats[int(parts[0])] = (float(parts[1]), int(parts[2]) * 1024)
+        except ValueError:
+            continue
+    for r in rows:
+        cpu, rss = stats.get(r["pid"], (None, None))
+        r["cpu_pct"] = cpu
+        r["rss_bytes"] = rss
 
 
 class ProcGPUSampler:
@@ -731,7 +793,7 @@ class ProcGPUSampler:
     """
 
     def __init__(self):
-        self.prev = {}       # pid -> (name, accumulated_ns)
+        self.prev = {}       # pid -> (name, accumulated_ns, last_submitted_ns)
         self.prev_time = None
         self.started = False  # have we taken a baseline snapshot yet?
 
@@ -752,10 +814,11 @@ class ProcGPUSampler:
         """
         snap = _gpu_client_totals()
         now = time.monotonic()
+        now_ns = mach_now_ns()
         elapsed = (now - self.prev_time) if self.prev_time is not None else 0.0
         rows = []
         if elapsed > 0:
-            for pid, (name, ns2) in snap.items():
+            for pid, (name, ns2, last_ns) in snap.items():
                 if pid in self.prev:
                     base = self.prev[pid][1]
                 elif self.started:
@@ -771,31 +834,74 @@ class ProcGPUSampler:
                     # interval -- WindowServer would report ~17,000,000 ms/s.
                     continue
                 dns = ns2 - base
-                if dns > 0:
+                # Idle clients (dns == 0) are listed too, below the busy ones.
+                # They still hold a GPU context, and it is exactly for them that
+                # LAST is informative -- a process busy in THIS interval has by
+                # definition just submitted, so its LAST is always "now".
+                if dns >= 0:
+                    # The driver may stamp lastSubmittedTime a hair after we read
+                    # the clock, so clamp the tiny negative that produces to 0.
+                    idle = max(0.0, (now_ns - last_ns) / 1e9) if last_ns else None
                     rows.append({"pid": pid, "name": name,
-                                 "gpu_ms_s": dns / 1e6 / elapsed})
+                                 "gpu_ms_s": dns / 1e6 / elapsed,
+                                 "last_s": idle})
         self.prev = snap
         self.prev_time = now
         self.started = True
-        rows.sort(key=lambda r: r["gpu_ms_s"], reverse=True)
+        _attach_proc_stats(rows)
+        # Busiest first; among the idle ones, most recently active first.
+        rows.sort(key=lambda r: (r["gpu_ms_s"],
+                                 -(r["last_s"] if r["last_s"] is not None else 1e9)),
+                  reverse=True)
         return rows
 
 
+def _fmt_bytes(n):
+    """'1.4G' / '331M' -- a memory figure that fits a narrow column."""
+    if not n:
+        return "-"
+    if n >= 1 << 30:
+        return f"{n / (1 << 30):.1f}G"
+    return f"{n / (1 << 20):.0f}M"
+
+
+def _fmt_age(seconds):
+    """How long ago the process last submitted GPU work."""
+    if seconds is None:
+        return "-"
+    if seconds < 1:
+        return "now"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.0f}h"
+
+
 def render_procs(rows, limit=10):
-    """Render a per-process GPU table (like nvidia-smi's process list)."""
-    lines = [f"{HEADER} GPU processes (per-process GPU ms/s){RESET}"]
+    """Render a per-process GPU table (like nvidia-smi's process list).
+
+    MEM is the process's RSS: Apple Silicon memory is unified, so that is the
+    memory it costs the SoC -- the GPU driver publishes no separate VRAM figure.
+    LAST is how long ago it last submitted GPU work.
+    """
+    lines = [f"{HEADER} GPU processes{RESET}"]
     if not rows:
         lines.append("  \x1b[2m(no GPU activity)\x1b[0m")
         return lines
-    lines.append(f"  {'PID':>7}  {'GPU ms/s':>9}  {'%':>5}  NAME")
+    lines.append(f"  {'PID':>7}  {'GPU ms/s':>9}  {'GPU%':>5}  {'CPU%':>6}"
+                 f"  {'MEM':>6}  {'LAST':>5}  NAME")
     for r in rows[:limit]:
         pct = min(100.0, r["gpu_ms_s"] / 10.0)   # 1000 ms/s == 100%
-        lines.append(f"  {r['pid']:>7}  {r['gpu_ms_s']:>9.1f}  {pct:>5.1f}  {r['name']}")
+        cpu = r.get("cpu_pct")
+        cpu_s = f"{cpu:.1f}" if cpu is not None else "-"
+        lines.append(f"  {r['pid']:>7}  {r['gpu_ms_s']:>9.1f}  {pct:>5.1f}"
+                     f"  {cpu_s:>6}  {_fmt_bytes(r.get('rss_bytes')):>6}"
+                     f"  {_fmt_age(r.get('last_s')):>5}  {r['name']}")
     return lines
 
 
 # --- Memory stats (mach host_statistics64 + sysctl, no sudo) -----------------
-_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 _libc.mach_host_self.restype = c_uint32
 _libc.host_statistics64.argtypes = [c_uint32, c_int, c_void_p, POINTER(c_uint32)]
 HOST_VM_INFO64 = 4

@@ -1,6 +1,6 @@
 # soltop
 
-Current version: **0.5.8**
+Current version: **0.6.0**
 
 An Apple Silicon GPU / CPU / power monitor for the terminal — like `asitop`,
 but **without `sudo` and without `powermetrics`**.
@@ -11,8 +11,10 @@ user privileges.
 ## Features
 
 - **GPU** usage + frequency, with a live history graph
-- **Per-process GPU usage** (like `nvidia-smi`), read from the driver's
-  IORegistry accounting — no sudo
+- **Per-process GPU table** (like `nvidia-smi`), read from the driver's
+  IORegistry accounting — no sudo. Shows GPU ms/s and GPU%, plus each process's
+  CPU%, memory, and how long ago it last submitted GPU work. Idle GPU clients
+  are listed too, so you can see who is still holding a GPU context.
 - **Power**: CPU / GPU / ANE / DRAM / Total (cur / avg / peak) + history graph
 - **CPU** E/P clusters: usage + DVFS level, with core counts (press `c` for a
   per-core breakdown)
@@ -55,6 +57,10 @@ Pressing the same key again returns to the dashboard.
 - No `sudo` and no `powermetrics` dependency.
 - GPU utilization and power come from IOReport residency / energy counters;
   they track trends well but are approximations, not firmware-exact values.
+- The process table's **MEM** is the process's RSS. Apple Silicon memory is
+  unified, so that *is* the memory it costs the SoC — the GPU driver publishes
+  no separate VRAM figure (per GPU client it exposes only the API, the
+  accumulated GPU time, and the last submission time).
 - **GPU frequency is exact MHz.** CPU clusters are reported as a *DVFS level*
   (`@ 62% DVFS`) rather than MHz: the CPU `voltage-states` table uses a raw unit
   with no documented MHz conversion, and it varies by generation. Earlier
