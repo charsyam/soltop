@@ -561,6 +561,120 @@ class SoltopLogicTests(unittest.TestCase):
                           3468, 3624, 3756, 3852, 3924, 3996, 4044, 4104, 4416,
                           4512])
 
+    def test_m5_ladders_match_powermetrics(self):
+        # Same numerator, a different chip: these raw values are an M5 Pro's
+        # (voltage-states5 = S-cluster, voltage-states22/23 = P0/P1), and the
+        # results are the exact ladders `sudo powermetrics` prints on it. The
+        # period encoding and the numerator both carry across generations.
+        s_raw = [50103, 40454, 33098, 28593, 25401, 22755, 20608, 19095, 17964,
+                 17120, 16449, 15968, 15648, 15471, 15297, 15212, 15128, 14800,
+                 14524, 14222]
+        p_raw = [48761, 39863, 32899, 28444, 24711, 22110, 20227, 18703, 17731,
+                 16908, 16205, 15693, 15297, 15212, 14962]
+
+        def to_mhz(raws):
+            return sorted(round(soltop.CPU_PERIOD_NUMERATOR / r) for r in raws)
+
+        self.assertEqual(to_mhz(s_raw),
+                         [1308, 1620, 1980, 2292, 2580, 2880, 3180, 3432, 3648,
+                          3828, 3984, 4104, 4188, 4236, 4284, 4308, 4332, 4428,
+                          4512, 4608])
+        self.assertEqual(to_mhz(p_raw),
+                         [1344, 1644, 1992, 2304, 2652, 2964, 3240, 3504, 3696,
+                          3876, 4044, 4176, 4284, 4308, 4380])
+
+    def test_ladder_binds_by_step_count_not_by_key_name(self):
+        # The voltage-states NUMBERING is chip-specific: on an M4 Pro the P
+        # ladder is voltage-states5, on an M5 Pro that same key holds the
+        # S-cluster's and the P clusters live in 22/23. Binding by key name
+        # therefore reads the wrong ladder on the next chip. Bind by the
+        # cluster's own P-state count instead.
+        tables = {
+            "voltage-states5": [1308, 4608],            # M5: S-cluster (2 steps)
+            "voltage-states22": [1344, 2000, 4380],     # M5: P0/P1     (3 steps)
+        }
+        self.assertEqual(soltop.match_ladder(2, tables), [1308, 4608])
+        self.assertEqual(soltop.match_ladder(3, tables), [1344, 2000, 4380])
+        # A cluster whose ladder is absent gets no clock, rather than a wrong one.
+        self.assertEqual(soltop.match_ladder(9, tables), [])
+        self.assertEqual(soltop.match_ladder(0, tables), [])
+
+    def test_ladder_prefers_the_non_sram_twin(self):
+        # The '-sram' tables carry the same ladder (in kHz), so both decode to
+        # the same MHz; pin the choice so it is stable rather than dict-ordered.
+        tables = {"voltage-states5-sram": [1308, 4608], "voltage-states5": [1308, 4608]}
+        self.assertEqual(soltop.match_ladder(2, tables), [1308, 4608])
+
+    def test_decode_ladder_rejects_a_table_it_cannot_read(self):
+        # Neither reading of these lands in a plausible MHz range, so no clock is
+        # reported -- a fabricated number is worse than a missing one.
+        self.assertIsNone(soltop._decode_ladder([1, 1, 1]))
+        self.assertIsNone(soltop._decode_ladder([]))
+        # Hz (GPU), kHz ('-sram'), and period (CPU) all decode.
+        self.assertEqual(soltop._decode_ladder([338000000, 1620000000]), [338.0, 1620.0])
+        self.assertEqual(soltop._decode_ladder([1308000, 4608000]), [1308.0, 4608.0])
+        self.assertEqual([round(v) for v in soltop._decode_ladder([50103, 14222])],
+                         [1308, 4608])
+
+    def test_cluster_type_keeps_p0_and_p1_apart(self):
+        # IOReport names cores <KIND>CPU<cluster><core><n>. Chips with two
+        # performance clusters (M4 Pro, M5 Pro, every Max/Ultra) must not have
+        # them averaged into one row: a busy cluster and a parked one would
+        # report as a single lukewarm number.
+        self.assertEqual(soltop.cluster_type("PCPU000")[0], "P0")
+        self.assertEqual(soltop.cluster_type("PCPU120")[0], "P1")
+        self.assertEqual(soltop.cluster_type("ECPU010")[0], "E0")
+        # An M5 Pro has S-cores and no E-cores at all, so the kind letter cannot
+        # be matched against an E/P allowlist -- that would drop every core.
+        self.assertEqual(soltop.cluster_type("SCPU000")[0], "S0")
+
+    def test_nsteps_counts_the_non_idle_states(self):
+        # The ladder length is the number of non-idle P-states IOReport names.
+        core = [{"states": {"DOWN": 1, "IDLE": 2, "V0P2": 3, "V1P1": 4, "V2P0": 5}}]
+        self.assertEqual(soltop._nsteps(core), 3)
+        self.assertEqual(soltop._nsteps([{"states": {}}]), 0)
+        self.assertEqual(soltop._nsteps([]), 0)
+        # The widest count wins: a core reporting a short list must not bind a
+        # shorter ladder and yield a plausible wrong clock.
+        self.assertEqual(soltop._nsteps([{"states": {"V0P1": 1}}] + core), 3)
+
+    def test_m5_pro_topology_end_to_end(self):
+        # An M5 Pro as powermetrics reports it: an S-cluster and TWO P-clusters,
+        # no E-cluster at all, with P1 fully powered down. Each cluster must bind
+        # its own ladder, and the parked one must report no clock rather than a
+        # made-up one.
+        def states(nsteps, top_res, idle):
+            s = dict(idle)
+            s.update({f"V{i}P{nsteps - 1 - i}": 0 for i in range(nsteps)})
+            s[f"V{nsteps - 1}P0"] = top_res
+            return s
+
+        raw = {"gpu": [], "cpu": [
+            {"name": "SCPU000", "subgroup": "CPU Core Performance States",
+             "active": 0.06, "states": states(20, 6, {"DOWN": 74, "IDLE": 20})},
+            {"name": "PCPU000", "subgroup": "CPU Core Performance States",
+             "active": 0.99, "states": states(15, 99, {"IDLE": 1})},
+            {"name": "PCPU100", "subgroup": "CPU Core Performance States",
+             "active": 0.0, "states": states(15, 0, {"DOWN": 100})},
+        ]}
+        saved = soltop.DVFS
+        soltop.DVFS = {
+            "voltage-states5": [1308.0, 4608.0][:1] + [4608.0] * 19,   # 20 steps
+            "voltage-states22": [1344.0] + [4380.0] * 14,              # 15 steps
+        }
+        try:
+            got = {c["key"]: c for c in soltop.organize(raw)["clusters"]}
+        finally:
+            soltop.DVFS = saved
+
+        self.assertEqual(sorted(got), ["P0", "P1", "S0"])
+        self.assertEqual(got["S0"]["mhz"], 4608.0)   # 20-step ladder, top step
+        self.assertEqual(got["P0"]["mhz"], 4380.0)   # 15-step ladder, top step
+        # Parked: no active residency to weight, so no clock is claimed.
+        self.assertEqual(got["P1"]["avg"], 0.0)
+        self.assertEqual(got["P1"]["mhz"], 0.0)
+        self.assertEqual(soltop._freq_txt(got["P1"]["mhz"]), "")
+
     def test_pstate_index_reads_the_ascending_v_field(self):
         # CPU names are V<v>P<p> with v ascending and p descending, so
         # v + p == len(ladder) - 1. Reading the P suffix inverts the ladder:

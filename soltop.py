@@ -43,6 +43,16 @@ CF.CFStringGetCString.restype = ctypes.c_bool
 CF.CFDictionaryGetValue.argtypes = [c_void_p, c_void_p]
 CF.CFDictionaryGetValue.restype = c_void_p
 
+# Enumerating a node's properties (used to discover voltage-states* keys, whose
+# numbering is chip-specific and so cannot be looked up by name).
+CF.CFDictionaryGetCount.argtypes = [c_void_p]
+CF.CFDictionaryGetCount.restype = c_long
+CF.CFDictionaryGetKeysAndValues.argtypes = [c_void_p, c_void_p, c_void_p]
+CF.CFDictionaryGetKeysAndValues.restype = None
+CF.CFGetTypeID.argtypes = [c_void_p]
+CF.CFGetTypeID.restype = c_long
+CF.CFDataGetTypeID.restype = c_long
+
 CF.CFArrayGetCount.argtypes = [c_void_p]
 CF.CFArrayGetCount.restype = c_int64
 CF.CFArrayGetValueAtIndex.argtypes = [c_void_p, c_int64]
@@ -300,80 +310,154 @@ POWER_LABELS = ("CPU", "GPU", "ANE", "DRAM")
 # factor. (Earlier versions normalised the raw ladder against a hardcoded
 # per-cluster max instead, which produced confidently wrong clocks on any chip
 # that did not match; that is what this replaces.)
+#
+# The numerator carries across generations: on an M5 Pro the same constant turns
+# voltage-states5 into the S-cluster's 1308..4608 ladder and voltage-states22/23
+# into the P0/P1 1344..4380 ladder, each matching powermetrics exactly.
 CPU_PERIOD_NUMERATOR = 65_532_288
-_VOLTAGE_STATE_KEYS = {"E": "voltage-states1", "P": "voltage-states5", "GPU": "voltage-states9"}
-# Tables stored as Hz rather than as a period.
-_ABSOLUTE_FREQ_CLUSTERS = ("GPU",)
+
+# The *numbering* of the voltage-states keys does NOT carry across generations,
+# so nothing here may hardcode it. On an M4 Pro the CPU ladders live in
+# voltage-states1 (E) and voltage-states5 (P); on an M5 Pro there is no E
+# cluster at all, voltage-states5 holds the S ladder, and P0/P1 live in
+# voltage-states22/23. Binding a cluster to a fixed key name therefore reads the
+# wrong ladder on the next chip -- confidently, and with no symptom other than a
+# wrong number. Instead, discover every voltage-states* table and bind each
+# cluster to one by matching the ladder LENGTH against the cluster's P-state
+# count, which IOReport reports per core (see load_dvfs/match_ladder).
+_VOLTAGE_STATE_RE = re.compile(r"^voltage-states(\d+)(-sram)?$")
+
+# Plausibility bounds. A derived ladder outside these is not a CPU/GPU DVFS
+# table (or the encoding changed), and printing a clock from it would be a
+# fabrication -- so the caller shows no MHz instead.
+_SANE_MHZ = (100.0, 10_000.0)
 
 
-def _read_u32_data(keynames):
-    """Read IORegistry CFData properties as lists of little-endian uint32.
+def _read_voltage_state_tables():
+    """Return {keyname: [uint32, ...]} for every voltage-states* CFData property.
 
-    Takes several key names and returns {keyname: [uint32, ...]}, walking the
-    IOService plane only once -- the traversal is by far the expensive part, so
-    doing it per key would triple the startup cost for no benefit.
+    Enumerates each IOService node's properties rather than looking up a fixed
+    set of key names, because the key numbering varies by chip and the names we
+    want are therefore not known in advance (an M5 Pro has voltage-states22/23
+    where an M4 Pro has none). Walks the IOService plane once -- the traversal
+    dominates the cost.
     """
     CF.CFDataGetLength.restype = c_long
     CF.CFDataGetLength.argtypes = [c_void_p]
     CF.CFDataGetBytePtr.restype = c_void_p
     CF.CFDataGetBytePtr.argtypes = [c_void_p]
+    data_type = CF.CFDataGetTypeID()
     it = c_uint32(0)
     if IOKIT.IORegistryCreateIterator(0, b"IOService", kIORegistryIterateRecursively, byref(it)) != 0:
         return {}
-    keys = {name: cfstr(name) for name in keynames}
     out = {}
     try:
-        while len(out) < len(keys):
+        while True:
             o = IOKIT.IOIteratorNext(it)
             if not o:
                 break
             props = c_void_p()
             if IOKIT.IORegistryEntryCreateCFProperties(o, byref(props), None, 0) == 0 and props.value:
-                for name, key in keys.items():
-                    if name in out:
-                        continue
-                    v = CF.CFDictionaryGetValue(props, key)
-                    if not v:
-                        continue
-                    n = CF.CFDataGetLength(v)
-                    if n >= 4:
-                        # from_address copies into a Python list before props is
-                        # released, so the CFData bytes need not outlive this call.
-                        out[name] = list((c_uint32 * (n // 4)).from_address(
-                            CF.CFDataGetBytePtr(v)))
+                n = CF.CFDictionaryGetCount(props)
+                if n > 0:
+                    keys = (c_void_p * n)()
+                    vals = (c_void_p * n)()
+                    CF.CFDictionaryGetKeysAndValues(props, keys, vals)
+                    for k, v in zip(keys, vals):
+                        name = from_cfstr(k)
+                        if not name or not _VOLTAGE_STATE_RE.match(name) or name in out:
+                            continue
+                        if not v or CF.CFGetTypeID(v) != data_type:
+                            continue
+                        nbytes = CF.CFDataGetLength(v)
+                        if nbytes >= 4:
+                            # from_address copies into a Python list before props
+                            # is released, so the bytes need not outlive this call.
+                            out[name] = list((c_uint32 * (nbytes // 4)).from_address(
+                                CF.CFDataGetBytePtr(v)))
                 CF.CFRelease(props)
             IOKIT.IOObjectRelease(o)
     finally:
         IOKIT.IOObjectRelease(it)
-        for key in keys.values():
-            CF.CFRelease(key)
     return out
 
 
-def load_dvfs():
-    """Return {cluster: {"values": [ascending MHz], "unit": "MHz"}} best-effort.
+def _decode_ladder(vals):
+    """Turn one table's raw first-of-pair uints into ascending MHz, or None.
 
-    GPU values are stored as Hz; CPU values as the period of each step (see
-    CPU_PERIOD_NUMERATOR). Both come out as true MHz.
+    The encoding is identified from the values themselves rather than from the
+    key name, because the key numbering is not stable across chips:
+
+      * Hz     -- large absolute values (GPU tables, and the '-sram' twins of
+                  the CPU tables, which carry kHz).
+      * period -- small values, converted via CPU_PERIOD_NUMERATOR.
+
+    Returns None when neither reading lands in a plausible MHz range, which is
+    how a table we do not actually understand gets rejected instead of printed.
+    """
+    if not vals:
+        return None
+    lo, hi = _SANE_MHZ
+    for mhz in ([v / 1e6 for v in vals],                    # Hz  -> MHz
+                [v / 1e3 for v in vals],                    # kHz -> MHz (-sram)
+                [CPU_PERIOD_NUMERATOR / v for v in vals]):  # period -> MHz
+        ladder = sorted(mhz)
+        if lo <= ladder[0] and ladder[-1] <= hi:
+            return ladder
+    return None
+
+
+def load_dvfs():
+    """Return {key: [ascending MHz]} for every voltage-states table we can decode.
+
+    Keyed by the raw IORegistry key name ('voltage-states5', ...), NOT by
+    cluster: which table belongs to which cluster is decided later, by matching
+    ladder length against the cluster's P-state count (see match_ladder). The
+    numbering differs per chip, so this layer must not presume a mapping.
     """
     try:
-        data = _read_u32_data(list(_VOLTAGE_STATE_KEYS.values()))
+        found = _read_voltage_state_tables()
     except Exception:
         return {}
     tables = {}
-    for cluster, key in _VOLTAGE_STATE_KEYS.items():
-        raw = data.get(key)
-        if not raw:
-            continue
-        vals = [f for f in raw[0::2] if f]      # first uint of each (freq, volt) pair
-        if not vals:
-            continue
-        if cluster in _ABSOLUTE_FREQ_CLUSTERS and max(vals) > 1_000_000:
-            mhz = [v / 1e6 for v in vals]                       # Hz -> MHz
-        else:
-            mhz = [CPU_PERIOD_NUMERATOR / v for v in vals]      # period -> MHz
-        tables[cluster] = {"values": sorted(mhz), "unit": "MHz"}
+    for key, raw in found.items():
+        vals = [f for f in raw[0::2] if f]   # first uint of each (freq, volt) pair
+        ladder = _decode_ladder(vals)
+        if ladder:
+            tables[key] = ladder
     return tables
+
+
+def match_ladder(nsteps, tables):
+    """Pick the DVFS ladder for a cluster with ``nsteps`` P-states, or [].
+
+    IOReport reports each core's P-states by name (V0P18, V1P17, ...), so the
+    number of non-idle states IS the length of that cluster's ladder. A table
+    with exactly that many entries is the cluster's ladder; anything else is a
+    different cluster's, or not a CPU table at all.
+
+    Verified on an M5 Pro, where the key numbering is nothing like the M4's:
+    S-cluster (20 steps) binds to voltage-states5, P0/P1 (15 steps each) to
+    voltage-states22/23 -- and the E-cluster key the old code hardcoded does not
+    exist on that chip.
+
+    Ambiguity is resolved by preferring the non-sram table, then the lowest key
+    number, so P0 and P1 (identical 15-step ladders, differing only in voltage)
+    both resolve to the same frequencies -- which is correct: powermetrics
+    prints the same ladder for both.
+    """
+    if not nsteps:
+        return []
+    def rank(item):
+        key, _ = item
+        m = _VOLTAGE_STATE_RE.match(key)
+        num = int(m.group(1)) if m else 1 << 30
+        is_sram = bool(m and m.group(2))
+        return (is_sram, num)
+    for key, ladder in sorted(tables.items(), key=rank):
+        if len(ladder) == nsteps:
+            return ladder
+    return []
 
 
 _VP_RE = re.compile(r"^V(\d+)P(\d+)$")   # CPU: V ascends with the step, P descends
@@ -403,6 +487,25 @@ def _pstate_index(name):
     if m:
         return int(m.group(1))
     return None
+
+
+def _nsteps(cores):
+    """Number of DVFS steps a cluster exposes = its non-idle P-state count.
+
+    IOReport names every state a core can occupy (DOWN, IDLE, V0P18, V1P17...),
+    so dropping the idle-family names leaves exactly one name per ladder rung.
+    That count is what binds the cluster to its voltage-states table.
+
+    Takes the widest count across the cluster's cores rather than the first: a
+    short count would bind a shorter ladder and report a plausible wrong clock,
+    whereas the widest is the ladder the hardware actually exposes.
+    """
+    best = 0
+    for core in cores:
+        states = core.get("states") or {}
+        n = sum(1 for name in states if not is_idle_state(name))
+        best = max(best, n)
+    return best
 
 
 def cluster_freq_mhz(cores, table):
@@ -957,13 +1060,27 @@ def thermal_state():
         return -1
 
 
-def cluster_type(name):
-    """Classify a core name into a cluster kind.
+_CORE_RE = re.compile(r"^([A-Z]+)CPU(\d)")   # ECPU000 -> ('E', '0'); PCPU120 -> ('P', '1')
 
-    ECPU000 / Efficiency0 -> efficiency, PCPU010 / Performance0 -> performance.
-    Unknown names fall back to 'other' so nothing is ever dropped.
+
+def cluster_type(name):
+    """Classify a core name into (key, label), keeping distinct clusters distinct.
+
+    IOReport names cores <KIND>CPU<cluster><core><n>, so the digit right after
+    'CPU' is the CLUSTER INDEX: PCPU0xx is P0, PCPU1xx is P1. Chips with more
+    than one performance cluster -- an M4 Pro's 10 P-cores, an M5 Pro's P0/P1,
+    any Max/Ultra part -- must not have them averaged into a single "P" row, or
+    a busy cluster and a sleeping one report as one lukewarm number.
+
+    The kind letter is taken from the name rather than matched against a known
+    set: an M5 Pro has S-cores and no E-cores at all, so an E/P allowlist would
+    silently drop every core on the machine.
     """
     u = (name or "").upper()
+    m = _CORE_RE.match(u)
+    if m:
+        kind, idx = m.group(1), m.group(2)
+        return (f"{kind}{idx}", f"CPU {kind}{idx}-cluster")
     if u.startswith("E"):
         return ("E", "CPU E-cluster")
     if u.startswith("P"):
@@ -982,7 +1099,7 @@ def organize(raw):
     # --- GPU: average across channels if there is more than one ---
     gpu_ch = raw.get("gpu", [])
     gpu_pct = (sum(e["active"] for e in gpu_ch) / len(gpu_ch) * 100) if gpu_ch else 0.0
-    gpu_mhz = cluster_freq_mhz(gpu_ch, tables.get("GPU", []))
+    gpu_mhz = cluster_freq_mhz(gpu_ch, match_ladder(_nsteps(gpu_ch), tables))
 
     # --- CPU: group only the per-core (state residency) channels by cluster ---
     cores = [e for e in raw.get("cpu", []) if "COMPLEX" not in (e["subgroup"] or "").upper()]
@@ -1000,7 +1117,9 @@ def organize(raw):
     for key in order:
         c = clusters[key]
         n = len(c["cores"])
-        table = tables.get(key, [])
+        # Bind this cluster's ladder by its own P-state count, not by its name:
+        # the voltage-states numbering differs per chip (see match_ladder).
+        table = match_ladder(_nsteps(c["cores"]), tables)
         avg = sum(x["active"] for x in c["cores"]) / n * 100
         mhz = cluster_freq_mhz(c["cores"], table)
         # Per-core figures for the 'c' (per-core) view. Computed here rather than
