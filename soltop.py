@@ -7,7 +7,7 @@ import ctypes
 import ctypes.util
 import time
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from ctypes import (
     c_void_p,
@@ -155,10 +155,11 @@ def active_ratio(states):
     total = sum(states.values())
     if total <= 0:
         return 0.0
-    idle = sum(res for name, res in states.items() if is_idle_state(name))
-    if idle == 0 and len(states) > 1:
+    idle_states = [res for name, res in states.items() if is_idle_state(name)]
+    if not idle_states and len(states) > 1:
         # Multiple states but none matched idle -> suspect a naming change.
         return None
+    idle = sum(idle_states)
     return max(0.0, (total - idle) / total)
 
 
@@ -355,13 +356,23 @@ class Sampler:
         self.power_cnt = 0      # number of samples accumulated
 
     def _release(self):
-        for ref in (self.prev, self.subscribed, self.chans):
+        for ref in (self.prev, self.subscribed, self.chans, self.sub):
             if ref:
                 try:
                     CF.CFRelease(ref)
                 except Exception:
                     pass
-        self.prev = self.subscribed = self.chans = None
+        self.prev = self.subscribed = self.chans = self.sub = None
+
+    def close(self):
+        """Release the native subscription and sample objects."""
+        self._release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
     def _recreate(self):
         """Release resources and re-subscribe when the subscription drops."""
@@ -474,7 +485,8 @@ class Sampler:
 
 def sample(interval=1.0):
     """Convenience helper that samples once and returns the result."""
-    return Sampler().read(interval)
+    with Sampler() as sampler:
+        return sampler.read(interval)
 
 
 # --- Per-process GPU usage (like nvidia-smi) ---------------------------------
@@ -923,7 +935,8 @@ def wrap_box(lines, cols, title=""):
     return out
 
 
-def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None):
+def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
+           process_only=False):
     """Draw the organize() result (view). Does no data-structure reasoning."""
     width = bar_width_for(cols)
     lines = []
@@ -936,6 +949,19 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None)
         tname = THERMAL_NAMES.get(ts, "?")
         thr = " throttling" if ts >= 1 else ""
         title += f"   thermal: {tcolor}{tname}{thr}{RESET}"
+
+    if process_only:
+        title = f"Soltop · GPU Processes · p: dashboard"
+        limit = max(1, height - 4) if height else 10
+        lines.extend(render_procs(procs or [], limit=limit, width=width))
+        if height:
+            content_height = max(0, height - 2)
+            del lines[content_height:]
+            while len(lines) < content_height:
+                lines.append("")
+        return ("\x1b[K\n").join(wrap_box(lines, cols, title)) + "\x1b[K"
+
+    title += "   p: processes"
 
     gpu_mhz = view.get("gpu_mhz", 0.0)
     freq_txt = f"@ {gpu_mhz:.0f} MHz" if gpu_mhz else ""
@@ -1013,10 +1039,12 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None)
     if lines and lines[-1] == "":
         lines.pop()
 
-    # Pad with blank lines so the bottom border sits at the very bottom of the
-    # screen (box uses 2 rows for the top/bottom border).
+    # Fit the complete frame to the available screen height. On very short
+    # terminals, lower-priority content at the bottom is omitted.
     if height:
-        while len(lines) < height - 2:
+        content_height = max(0, height - 2)
+        del lines[content_height:]
+        while len(lines) < content_height:
             lines.append("")
 
     # Draw a full outer border with the machine name + thermal as the title.
@@ -1026,7 +1054,45 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None)
     return ("\x1b[K\n").join(boxed) + "\x1b[K"
 
 
+class KeyReader:
+    """Read single terminal keys without blocking, restoring mode on exit."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.fd = None
+        self.attrs = None
+
+    def __enter__(self):
+        if self.stream.isatty():
+            import termios
+            import tty
+            self.fd = self.stream.fileno()
+            self.attrs = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def read_available(self):
+        if self.fd is None:
+            return ""
+        import os
+        import select
+        keys = []
+        while select.select([self.fd], [], [], 0)[0]:
+            data = os.read(self.fd, 1)
+            if not data:
+                break
+            keys.append(data.decode("utf-8", "ignore"))
+        return "".join(keys)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.fd is not None and self.attrs is not None:
+            import termios
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.attrs)
+
+
 def live(interval=1.0, cols_override=None):
+    import sys
+
     sampler = Sampler()
     proc_sampler = ProcGPUSampler()
     gpu_hist = deque(maxlen=200)
@@ -1035,27 +1101,33 @@ def live(interval=1.0, cols_override=None):
     # and overwrite in place to avoid flicker.
     print(HIDE_CURSOR + CLEAR, end="", flush=True)
     last_size = None
+    process_only = False
     try:
-        while True:
-            view = organize(sampler.read(interval))
-            gpu_hist.append(view["gpu_pct"])
-            soc_hist.append(view.get("power", {}).get("SoC", 0) / 1000)
-            try:
-                procs = proc_sampler.step(interval)
-            except Exception:
-                procs = []
-            tcols, rows = term_size()
-            cols = cols_override or tcols
-            # On resize, wipe the screen once so wrapped/old lines don't linger.
-            if (cols, rows) != last_size:
-                print(CLEAR, end="")
-                last_size = (cols, rows)
-            frame = render(view, cols, gpu_hist, procs, height=rows, soc_hist=soc_hist)
-            # Overwrite the whole frame in one write, then clear any lines below.
-            print(HOME + frame + CLEAR_TO_END, end="", flush=True)
+        with KeyReader(sys.stdin) as keys:
+            while True:
+                view = organize(sampler.read(interval))
+                gpu_hist.append(view["gpu_pct"])
+                soc_hist.append(view.get("power", {}).get("SoC", 0) / 1000)
+                try:
+                    procs = proc_sampler.step(interval)
+                except Exception:
+                    procs = []
+                if keys.read_available().lower().count("p") % 2:
+                    process_only = not process_only
+                tcols, rows = term_size()
+                cols = cols_override or tcols
+                # On resize, wipe the screen once so wrapped/old lines don't linger.
+                if (cols, rows) != last_size:
+                    print(CLEAR, end="")
+                    last_size = (cols, rows)
+                frame = render(view, cols, gpu_hist, procs, height=rows,
+                               soc_hist=soc_hist, process_only=process_only)
+                # Overwrite the whole frame in one write, then clear any lines below.
+                print(HOME + frame + CLEAR_TO_END, end="", flush=True)
     except KeyboardInterrupt:
         pass
     finally:
+        sampler.close()
         print(SHOW_CURSOR + "\n", end="", flush=True)
 
 
@@ -1088,19 +1160,23 @@ def main():
     if args.once:
         sampler = Sampler()
         try:
-            proc_sampler = ProcGPUSampler()
-            proc_sampler.step()  # establish the process baseline before the wait
-        except Exception:
-            proc_sampler = None
-        view = organize(sampler.read(args.interval))
-        hist = deque([view["gpu_pct"]])
-        shist = deque([view.get("power", {}).get("SoC", 0) / 1000])
-        try:
-            procs = proc_sampler.step() if proc_sampler else []
-        except Exception:
-            procs = []
-        tcols, rows = term_size()
-        print(render(view, cols_override or tcols, hist, procs, height=rows, soc_hist=shist))
+            try:
+                proc_sampler = ProcGPUSampler()
+                proc_sampler.step()  # establish the process baseline before the wait
+            except Exception:
+                proc_sampler = None
+            view = organize(sampler.read(args.interval))
+            hist = deque([view["gpu_pct"]])
+            shist = deque([view.get("power", {}).get("SoC", 0) / 1000])
+            try:
+                procs = proc_sampler.step() if proc_sampler else []
+            except Exception:
+                procs = []
+            tcols, rows = term_size()
+            print(render(view, cols_override or tcols, hist, procs,
+                         height=rows, soc_hist=shist))
+        finally:
+            sampler.close()
     else:
         live(args.interval, cols_override)
 

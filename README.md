@@ -1,6 +1,6 @@
 # soltop
 
-Current version: **0.2.0**
+Current version: **0.3.0**
 
 An Apple Silicon GPU / CPU / power monitor for the terminal — like `asitop`,
 but **without `sudo` and without `powermetrics`**.
@@ -33,6 +33,9 @@ soltop -i 0.5       # sample every 0.5s
 soltop --once       # print one frame and exit
 soltop --version
 ```
+
+While running, press `p` to toggle between the dashboard and the full GPU
+process list. Press `Ctrl-C` to quit.
 
 ## Requirements
 
