@@ -291,8 +291,23 @@ def discover_state_channels():
 # Energy Model channels of interest -> display label. Their delta over the
 # interval is energy consumed, so power (mW) = delta / interval_seconds.
 # "SoC" is derived as the sum of these components.
+#
+# These four aggregate names are stable across chips -- verified present and
+# correct on both an M4 Pro and an M5 Pro (see tools/fixtures/m5-energy.txt),
+# even though the per-cluster channels beneath them are renamed wholesale
+# (an M4's PACC0_CPU/EACC_CPU become an M5's MCPU0/PCPU/PACC_0). Deriving power
+# by discovering and summing those cluster channels was tried and does NOT
+# survive the chip change; the aggregates do.
 ENERGY_KEYS = {"CPU Energy": "CPU", "GPU": "GPU", "ANE": "ANE", "DRAM": "DRAM"}
 POWER_LABELS = ("CPU", "GPU", "ANE", "DRAM")
+
+# Not every Energy Model channel counts in mJ: 'GPU Energy' is in uJ, and reading
+# it as mJ yields 272 kW on an M4 Pro and 2833 W on an M5 Pro. We do not use that
+# channel today, but a future chip that drops the one we do use ('GPU') would
+# silently render a four-digit wattage rather than fail. No Apple SoC in a Mac
+# draws anywhere near this, so a reading above it is a unit mismatch, not power:
+# treat the channel as unreadable and show nothing.
+POWER_SANE_MAX_MW = 200_000.0    # 200 W
 
 
 # --- DVFS frequency tables (voltage-states in IORegistry, no sudo) -----------
@@ -713,7 +728,14 @@ class Sampler:
                 if name in ENERGY_KEYS:
                     try:
                         energy = IOR.IOReportSimpleGetIntegerValue(chan, 0)
-                        current_power[ENERGY_KEYS[name]] = max(0.0, energy / elapsed)
+                        mw = max(0.0, energy / elapsed)
+                        # A reading above any plausible SoC budget means this
+                        # channel is not counting in mJ (see POWER_SANE_MAX_MW).
+                        # Report nothing rather than a fabricated four-digit
+                        # wattage, the way an unreadable DVFS table reports no
+                        # clock.
+                        if mw <= POWER_SANE_MAX_MW:
+                            current_power[ENERGY_KEYS[name]] = mw
                     except Exception:
                         pass
                 continue

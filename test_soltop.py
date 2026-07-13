@@ -710,6 +710,50 @@ class SoltopLogicTests(unittest.TestCase):
         # shorter ladder and yield a plausible wrong clock.
         self.assertEqual(soltop._nsteps([{"states": {"V0P1": 1}}] + core), 3)
 
+    def test_power_rejects_a_channel_counting_in_the_wrong_unit(self):
+        # Not every Energy Model channel counts in mJ. 'GPU Energy' is in uJ:
+        # read as mJ it comes out as 272 kW on an M4 Pro and 2833 W on an M5.
+        # soltop uses 'GPU' today, so this is latent -- but a chip that drops
+        # 'GPU' and keeps only 'GPU Energy' would render a four-digit wattage
+        # with total confidence. Above any plausible SoC budget, report nothing.
+        self.assertGreater(soltop.POWER_SANE_MAX_MW, 100_000.0)   # a real SoC fits
+        self.assertLess(soltop.POWER_SANE_MAX_MW, 1_000_000.0)    # 272 kW does not
+
+        # The real captured values: an M4 Pro's implausible reading is rejected,
+        # while both chips' genuine CPU/GPU readings are kept.
+        for mw, ok in ((272_731_404.0, False),   # M4 Pro 'GPU Energy' (uJ)
+                       (2_833_000.0, False),     # M5 Pro 'GPU Energy' (uJ)
+                       (1195.0, True),           # M4 Pro 'CPU Energy'
+                       (786.0, True),            # M5 Pro 'CPU Energy'
+                       (3.0, True)):             # M5 Pro 'GPU'
+            self.assertEqual(mw <= soltop.POWER_SANE_MAX_MW, ok, mw)
+
+    def test_power_filter_engages_on_the_real_read_path(self):
+        # Not just the constant -- the filter has to be applied where the energy
+        # delta is actually turned into a wattage. Aim a label at 'GPU Energy'
+        # (which counts in uJ) and drive a real Sampler.read: the GPU must report
+        # nothing rather than the ~272 kW that channel reads as.
+        try:
+            sampler = soltop.Sampler()
+        except Exception as e:                      # not on Apple Silicon
+            self.skipTest(f"IOReport unavailable: {e}")
+
+        saved = soltop.ENERGY_KEYS
+        try:
+            soltop.ENERGY_KEYS = {"CPU Energy": "CPU", "GPU Energy": "GPU"}
+            power = sampler.read(0.3)["power"]
+        finally:
+            soltop.ENERGY_KEYS = saved
+            sampler.close()
+
+        # 'GPU Energy' is real and non-zero on this machine, but implausible as
+        # power -- so it is dropped rather than rendered.
+        self.assertEqual(power["GPU"], 0.0)
+        # ... while the sane channel still reports, and the SoC total (a sum of
+        # the survivors) cannot be poisoned by the rejected one.
+        self.assertGreater(power["CPU"], 0.0)
+        self.assertLessEqual(power["SoC"], soltop.POWER_SANE_MAX_MW)
+
     def test_unknown_silicon_hides_the_clock_instead_of_faking_one(self):
         # The whole point of binding ladders by shape rather than by name: on a
         # chip whose tables we cannot read, soltop must show NO clock. A wrong

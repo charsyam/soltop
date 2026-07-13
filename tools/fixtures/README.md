@@ -20,6 +20,25 @@ three things on it rather than inferring them:
 | `m5pro-powermetrics.txt` | the true ladders: S 1308..4608, P0/P1 1344..4380 MHz |
 | `m5pro-voltage-states.txt` | which IORegistry keys hold them (5, 22, 23 — *not* the M4's 1 and 5) |
 | `m5pro-ioreport-channels.txt` | the core names: `PCPU0..4` are **Super**, `MCPU00..14` are **Performance** |
+| `m5pro-energy-model.txt` | the power channels — and why they are read the way they are |
+
+### Why power still reads channels by name
+
+The obvious hardening — discover the per-cluster energy accumulators and sum
+them, rather than trusting a name — was **tried and rejected**, because this
+capture shows it does not survive the chip change:
+
+    M4 Pro   EACC_CPU, PACC0_CPU, PACC1_CPU        (sum == 'CPU Energy', ratio 1.000)
+    M5 Pro   MCPU0, MCPU0_0..4, PCPU, PACC_0/1/2   (nothing matches the M4 pattern)
+
+The *aggregate* names, by contrast, are identical on both chips and report
+correct values (`CPU Energy`, `GPU`, `ANE`, `DRAM`). The high-level abstraction
+turned out to be the stable one; the detail beneath it is what churns. So
+`ENERGY_KEYS` stays — but see `POWER_SANE_MAX_MW`, which guards the failure that
+*would* be silent: `GPU Energy` counts in µJ, and reading it as mJ yields 272 kW
+on an M4 and 2833 W on an M5. We don't use that channel, but a chip that drops
+`GPU` and keeps only `GPU Energy` would otherwise render a four-digit wattage
+with total confidence.
 
 The three surprises this chip sprang, all reproduced in `test_soltop.py`:
 
