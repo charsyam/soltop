@@ -7,7 +7,10 @@ tools/fixtures/ for the M4 Pro / M5 Pro captures this is calibrated against.
 
 This module is pure policy over raw tables; it holds no IOReport state.
 """
+import json
+import os
 import re
+import tempfile
 
 from ..ffi import (CF, IOKIT, c_void_p, c_uint32, c_long, byref,
                    from_cfstr, kIORegistryIterateRecursively)
@@ -96,6 +99,94 @@ _VOLTAGE_STATE_RE = re.compile(r"^voltage-states(\d+)(-sram)?$")
 # table (or the encoding changed), and printing a clock from it would be a
 # fabrication -- so the caller shows no MHz instead.
 _SANE_MHZ = (100.0, 10_000.0)
+
+_CACHE_SCHEMA = 1
+
+
+def _dvfs_cache_identity():
+    """Return the hardware/OS identity that makes decoded tables reusable."""
+    try:
+        from .system import _sysctl_str
+        model = _sysctl_str("hw.model")
+        os_build = _sysctl_str("kern.osversion")
+        return (model, os_build) if model and os_build else None
+    except Exception:
+        return None
+
+
+def _dvfs_cache_path():
+    root = os.environ.get(
+        "SOLTOP_CACHE_DIR",
+        os.path.expanduser("~/Library/Caches/soltop"),
+    )
+    return os.path.join(root, "dvfs.json")
+
+
+def _valid_cached_tables(value):
+    """Validate untrusted JSON and restore the tuple/list table shape."""
+    if not isinstance(value, dict) or not value:
+        return None
+    lo, hi = _SANE_MHZ
+    out = {}
+    for key, entry in value.items():
+        if not isinstance(key, str) or not _VOLTAGE_STATE_RE.match(key):
+            return None
+        if not isinstance(entry, list) or len(entry) != 2:
+            return None
+        kind, ladder = entry
+        if kind not in ("gpu", "sram", "period") or not isinstance(ladder, list):
+            return None
+        if not ladder or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                             for v in ladder):
+            return None
+        values = [float(v) for v in ladder]
+        if values != sorted(values) or values[0] < lo or values[-1] > hi:
+            return None
+        out[key] = (kind, values)
+    return out
+
+
+def _load_dvfs_cache():
+    identity = _dvfs_cache_identity()
+    if identity is None:
+        return None
+    try:
+        with open(_dvfs_cache_path(), encoding="utf-8") as f:
+            cached = json.load(f)
+        if (cached.get("schema"), cached.get("model"), cached.get("os_build")) != (
+                _CACHE_SCHEMA, identity[0], identity[1]):
+            return None
+        return _valid_cached_tables(cached.get("tables"))
+    except (OSError, ValueError, TypeError, AttributeError, UnicodeError):
+        return None
+
+
+def _save_dvfs_cache(tables):
+    if not tables:
+        return
+    identity = _dvfs_cache_identity()
+    if identity is None:
+        return
+    path = _dvfs_cache_path()
+    tmp = None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".dvfs-", suffix=".tmp",
+                                   dir=os.path.dirname(path))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"schema": _CACHE_SCHEMA, "model": identity[0],
+                       "os_build": identity[1], "tables": tables},
+                      f, separators=(",", ":"))
+        os.replace(tmp, path)
+        tmp = None
+    except (OSError, TypeError, ValueError):
+        pass
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 # An Apple GPU clocks far below its CPU (an M4 Pro tops out at 1578 MHz, an M5
 # Pro at 1620). Several unrelated Hz tables sit alongside it in the IORegistry
@@ -226,6 +317,9 @@ def load_dvfs():
     numbering differs per chip, so this layer must not presume a mapping.
     ``kind`` is 'period' for CPU tables and 'absolute' for GPU ones.
     """
+    cached = _load_dvfs_cache()
+    if cached is not None:
+        return cached
     try:
         found = _read_voltage_state_tables()
     except Exception:
@@ -236,6 +330,7 @@ def load_dvfs():
         decoded = _decode_ladder(vals)
         if decoded:
             tables[key] = decoded
+    _save_dvfs_cache(tables)
     return tables
 
 

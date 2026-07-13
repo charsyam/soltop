@@ -1,6 +1,8 @@
 import io
+import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import unittest.mock
@@ -740,6 +742,40 @@ class SoltopLogicTests(unittest.TestCase):
         kind, ladder = soltop._decode_ladder([50103, 14222])
         self.assertEqual((kind, [round(v) for v in ladder]), ("period", [1308, 4608]))
 
+    def test_dvfs_cache_skips_the_registry_walk_on_the_next_run(self):
+        raw = {"voltage-states1": [64250, 900, 25283, 900]}
+        with tempfile.TemporaryDirectory() as cache_dir, \
+                unittest.mock.patch.dict(os.environ,
+                                         {"SOLTOP_CACHE_DIR": cache_dir}), \
+                unittest.mock.patch.object(soltop_dvfs, "_dvfs_cache_identity",
+                                            return_value=("Mac-test", "OS-test")):
+            with unittest.mock.patch.object(soltop_dvfs, "_read_voltage_state_tables",
+                                            return_value=raw) as read:
+                first = soltop_dvfs.load_dvfs()
+            self.assertEqual(read.call_count, 1)
+            self.assertTrue(os.path.isfile(os.path.join(cache_dir, "dvfs.json")))
+
+            with unittest.mock.patch.object(
+                    soltop_dvfs, "_read_voltage_state_tables",
+                    side_effect=AssertionError("cache hit must not walk IORegistry")):
+                second = soltop_dvfs.load_dvfs()
+            self.assertEqual(second, first)
+
+    def test_corrupt_dvfs_cache_falls_back_to_the_registry(self):
+        raw = {"voltage-states1": [64250, 900, 25283, 900]}
+        with tempfile.TemporaryDirectory() as cache_dir, \
+                unittest.mock.patch.dict(os.environ,
+                                         {"SOLTOP_CACHE_DIR": cache_dir}), \
+                unittest.mock.patch.object(soltop_dvfs, "_dvfs_cache_identity",
+                                            return_value=("Mac-test", "OS-test")):
+            with open(os.path.join(cache_dir, "dvfs.json"), "w") as f:
+                f.write("not json")
+            with unittest.mock.patch.object(soltop_dvfs, "_read_voltage_state_tables",
+                                            return_value=raw) as read:
+                tables = soltop_dvfs.load_dvfs()
+            self.assertEqual(read.call_count, 1)
+            self.assertIn("voltage-states1", tables)
+
     def test_m5_core_names_group_into_the_real_clusters(self):
         # The core naming is chip-specific and the letters INVERT between chips:
         #   M4 Pro:  ECPU000..ECPU030   PCPU000..PCPU140
@@ -1132,7 +1168,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.11.1")
+        self.assertEqual(soltop.__version__, "0.11.2")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200
