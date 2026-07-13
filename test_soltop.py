@@ -74,10 +74,11 @@ class LiveKeyTests(unittest.TestCase):
 
         def spy(view, cols=80, gpu_hist=None, procs=None, height=None,
                 soc_hist=None, temp_hist=None, process_only=False,
-                single_sample=False, core_only=False):
+                single_sample=False, core_only=False, temp_only=False):
             seen.append(process_only)
             return real_render(view, cols, gpu_hist, procs, height, soc_hist,
-                               temp_hist, process_only, single_sample, core_only)
+                               temp_hist, process_only, single_sample, core_only,
+                               temp_only)
 
         with unittest.mock.patch.object(soltop_ui, "Sampler", _FakeSampler), \
                 unittest.mock.patch.object(soltop_ui, "ProcGPUSampler", _FakeProcSampler), \
@@ -108,11 +109,13 @@ class LiveKeyTests(unittest.TestCase):
 
         def spy(view, cols=80, gpu_hist=None, procs=None, height=None,
                 soc_hist=None, temp_hist=None, process_only=False,
-                single_sample=False, core_only=False):
+                single_sample=False, core_only=False, temp_only=False):
             seen.append("proc" if process_only
-                        else "core" if core_only else "dash")
+                        else "core" if core_only
+                        else "temp" if temp_only else "dash")
             return real_render(view, cols, gpu_hist, procs, height, soc_hist,
-                               temp_hist, process_only, single_sample, core_only)
+                               temp_hist, process_only, single_sample, core_only,
+                               temp_only)
 
         with unittest.mock.patch.object(soltop_ui, "Sampler", _FakeSampler), \
                 unittest.mock.patch.object(soltop_ui, "ProcGPUSampler", _FakeProcSampler), \
@@ -126,6 +129,18 @@ class LiveKeyTests(unittest.TestCase):
     def test_c_toggles_the_per_core_view_and_back(self):
         self.assertEqual(self._run_live_views(["", "c", "", "c", "", "q"]),
                          ["dash", "core", "core", "dash", "dash"])
+
+    def test_t_toggles_the_temperature_view_and_back(self):
+        # The temperature graph costs 7 rows; on a short terminal that pushed CPU
+        # and memory off the dashboard. The dashboard keeps a one-line summary
+        # and the graph lives behind 't'.
+        self.assertEqual(self._run_live_views(["", "t", "", "t", "", "q"]),
+                         ["dash", "temp", "temp", "dash", "dash"])
+
+    def test_all_three_views_are_mutually_exclusive(self):
+        # Pressing one view key from another switches rather than stacking.
+        self.assertEqual(self._run_live_views(["t", "p", "c", "t", "q"]),
+                         ["temp", "proc", "core", "temp"])
 
     def test_core_and_process_views_are_mutually_exclusive(self):
         # 'c' from the process view switches to cores rather than stacking, and
@@ -1078,7 +1093,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.10.0")
+        self.assertEqual(soltop.__version__, "0.10.1")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200

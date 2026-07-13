@@ -13,6 +13,7 @@ from .core.power import POWER_LABELS
 from .core.process import ProcGPUSampler
 from .core.sampler import Sampler
 from .core.system import THERMAL_NAMES, machine_name, mem_stats, thermal_state
+from .core.temps import die_temps
 from .core.view import organize
 
 
@@ -227,6 +228,71 @@ def _freq_txt(mhz):
     return f"@ {mhz:.0f} MHz"
 
 
+def _temp_color(celsius):
+    """Colour a die reading. Apple Silicon throttles well before 100 C."""
+    if celsius >= 90:
+        return "\x1b[1;91m"      # red
+    if celsius >= 70:
+        return "\x1b[1;93m"      # yellow
+    return "\x1b[1;92m"          # green
+
+
+def _temp_txt(temp, temp_hist=None, single_sample=False):
+    """'74.5°C  (avg 71  peak 77)   die max; avg 69.5°C' -- the one-line summary.
+
+    Leads with the die's hottest spot: that is what the thermal governor reacts
+    to, so it is the number that predicts a throttle.
+    """
+    hot = temp["max"]
+    stats = ""
+    if not single_sample and temp_hist:
+        stats = (f"  (avg {sum(temp_hist) / len(temp_hist):.0f}°C"
+                 f"  peak {max(temp_hist):.0f}°C)")
+    return (f"{_temp_color(hot)}{hot:.1f}°C{RESET}{HEADER}{stats}"
+            f"   (die max; avg {temp['avg']:.1f}°C)")
+
+
+def render_temp(view, width, temp_hist=None, height=None):
+    """The 't' view: the die temperature, its history, and the raw sensors.
+
+    The dashboard only has room for the one-line summary. This is where the
+    trend lives -- and the trend is the point, because thermal_state() reports
+    'nominal' the whole way from 51 C to 77 C.
+    """
+    temp = view.get("soc_temp") or {}
+    if not temp:
+        return [f"{HEADER} SoC Temperature{RESET}",
+                "  \x1b[2m(no die sensor readable on this machine)\x1b[0m"]
+
+    lines = [f"{HEADER} SoC Temp: {_temp_txt(temp, temp_hist)}{RESET}", ""]
+    if temp_hist:
+        # 100 C full-scale: the top of the graph is the wall you do not want to
+        # reach, so the bar height reads as "how close am I".
+        norm = [min(100.0, c) for c in temp_hist]
+        lines.extend(vgraph(norm, height=GRAPH_HEIGHT + 4,
+                            width=max(10, width - 7),
+                            label_max=100.0, label_unit="C",
+                            color=_temp_color(temp["max"])))
+        lines.append("")
+
+    # The raw sensors. The same physical sensor is published by several HID
+    # services, so identical readings repeating is expected, not a bug.
+    readings = sorted(die_temps(), reverse=True)
+    if readings:
+        lines.append(f"{HEADER} Die sensors ({len(readings)} readings){RESET}")
+        per_row = max(1, (width - 2) // 9)
+        for i in range(0, len(readings), per_row):
+            chunk = readings[i:i + per_row]
+            lines.append("  " + " ".join(
+                f"{_temp_color(c)}{c:5.1f}°C{RESET}" for c in chunk))
+    lines.append("")
+    lines.append("  \x1b[2mThe SoC die, not the GPU -- no GPU-specific sensor "
+                 "exists.\x1b[0m")
+    lines.append("  \x1b[2mPinning the GPU moves these ~+1°C; the CPU, ~+13°C."
+                 "\x1b[0m")
+    return lines
+
+
 def render_cores(view, width, limit=None):
     """Render every CPU core individually, grouped by cluster.
 
@@ -263,7 +329,8 @@ def render_cores(view, width, limit=None):
 
 def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
            temp_hist=None,
-           process_only=False, single_sample=False, core_only=False):
+           process_only=False, single_sample=False, core_only=False,
+           temp_only=False):
     """Draw the organize() result (view). Does no data-structure reasoning.
 
     ``single_sample`` suppresses the avg/peak columns, which carry no information
@@ -309,7 +376,12 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
         lines.extend(render_cores(view, width, limit=limit))
         return _fit(lines, title)
 
-    title += "   p: processes   c: cores   q: quit"
+    if temp_only:
+        title = f"Soltop v{__version__} · SoC Temperature · t: dashboard · q: quit"
+        lines.extend(render_temp(view, width, temp_hist, height=height))
+        return _fit(lines, title)
+
+    title += "   p: processes   c: cores   t: temp   q: quit"
 
     freq_txt = _freq_txt(view.get("gpu_mhz", 0.0))
     cur = view["gpu_pct"]
@@ -354,26 +426,14 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
         lines.append(f"  {comp}" + ("" if single_sample else "   (cur/avg/peak)"))
         lines.append("")
 
-    # SoC die temperature. Worth a graph of its own: the thermal state stays
-    # 'nominal' while the die climbs 20 C, so the trend is the early warning the
-    # state flag is not. NOT a GPU temperature -- see core/temps.py.
+    # SoC die temperature -- ONE line on the dashboard. The graph is worth having
+    # (the thermal state stays 'nominal' while the die climbs 20 C, so the trend
+    # is the early warning the flag is not), but it costs 7 rows, and on a short
+    # terminal that pushed CPU and memory off the frame. It lives behind 't'.
     temp = view.get("soc_temp") or {}
     if temp:
-        hot = temp["max"]
-        tcol = "\x1b[1;92m" if hot < 70 else "\x1b[1;93m" if hot < 90 else "\x1b[1;91m"
-        tstats = ""
-        if not single_sample and temp_hist:
-            tstats = (f"  (avg {sum(temp_hist) / len(temp_hist):.0f}°C"
-                      f"  peak {max(temp_hist):.0f}°C)")
-        lines.append(f"{HEADER} SoC Temp: {hot:.1f}°C{tstats}"
-                     f"   (die max; avg {temp['avg']:.1f}°C){RESET}")
-        if temp_hist is not None:
-            # 100 C full-scale: Apple Silicon throttles hard well before this, so
-            # the top of the graph is the wall you do not want to reach.
-            scale = 100.0
-            norm = [min(100.0, (c / scale) * 100) for c in temp_hist]
-            lines.extend(vgraph(norm, height=GRAPH_HEIGHT, width=max(10, width - 7),
-                                label_max=scale, label_unit="C", color=tcol))
+        lines.append(f"{HEADER} SoC Temp: {_temp_txt(temp, temp_hist, single_sample)}"
+                     f"{RESET}")
         lines.append("")
 
     # Memory: asitop-style gauge + text breakdown (wired / compressed / swap).
@@ -474,6 +534,7 @@ def live(interval=1.0, cols_override=None):
     last_size = None
     process_only = False
     core_only = False
+    temp_only = False
     retries = 0
     try:
         with KeyReader(sys.stdin) as keys:
@@ -510,10 +571,13 @@ def live(interval=1.0, cols_override=None):
                 for k in keys.read_available().lower():
                     if k == "p":
                         process_only = not process_only
-                        core_only = False
+                        core_only = temp_only = False
                     elif k == "c":
                         core_only = not core_only
-                        process_only = False
+                        process_only = temp_only = False
+                    elif k == "t":
+                        temp_only = not temp_only
+                        process_only = core_only = False
                     elif k in ("q", "\x1b", "\x03"):
                         return
                 tcols, rows = term_size()
@@ -524,7 +588,8 @@ def live(interval=1.0, cols_override=None):
                     last_size = (cols, rows)
                 frame = render(view, cols, gpu_hist, procs, height=rows,
                                soc_hist=soc_hist, temp_hist=temp_hist,
-                               process_only=process_only, core_only=core_only)
+                               process_only=process_only, core_only=core_only,
+                               temp_only=temp_only)
                 # Overwrite the whole frame in one write, then clear any lines below.
                 print(HOME + frame + CLEAR_TO_END, end="", flush=True)
     except KeyboardInterrupt:

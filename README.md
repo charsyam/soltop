@@ -2,7 +2,7 @@
 
 [![test](https://github.com/charsyam/soltop/actions/workflows/test.yml/badge.svg)](https://github.com/charsyam/soltop/actions/workflows/test.yml)
 
-Current version: **0.10.0**
+Current version: **0.10.1**
 
 **Which process is eating my GPU?** On Apple Silicon that question is
 surprisingly hard to answer. `soltop` answers it — with a per-process GPU table
@@ -61,9 +61,9 @@ is excellent and is a single Rust binary. Reach for soltop when you need to know
   P0/P1 and an M5 Pro's S + P0/P1 both come out right.
 - **Power**: CPU / GPU / ANE / DRAM / Total (cur / avg / peak) + history graph
 - **Memory**: used / wired / compressed / swap
-- **SoC die temperature** (max / avg) with a history graph — the thermal state
-  flag stays `nominal` while the die climbs 20 °C, so the trend is the early
-  warning the flag is not
+- **SoC die temperature** (max / avg), with a history graph behind `t` — the
+  thermal state flag stays `nominal` while the die climbs 20 °C, so the trend is
+  the early warning the flag is not
 - **JSON / CSV / Prometheus** output for piping and dashboards
 - Auto-fits the terminal size, boxed asitop-style UI
 
@@ -88,6 +88,7 @@ While running:
 |-----|--------|
 | `p` | toggle the full GPU process list |
 | `c` | toggle the per-core CPU view (every E/P core individually, instead of the cluster averages) |
+| `t` | toggle the SoC temperature view — history graph and every die sensor |
 | `q` | quit (`Ctrl-C` also works) |
 
 Pressing the same key again returns to the dashboard.
