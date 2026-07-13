@@ -776,6 +776,24 @@ class SoltopLogicTests(unittest.TestCase):
             self.assertEqual(read.call_count, 1)
             self.assertIn("voltage-states1", tables)
 
+    def test_unknown_dvfs_cache_schema_is_discarded(self):
+        raw = {"voltage-states1": [64250, 900, 25283, 900]}
+        with tempfile.TemporaryDirectory() as cache_dir, \
+                unittest.mock.patch.dict(os.environ,
+                                         {"SOLTOP_CACHE_DIR": cache_dir}), \
+                unittest.mock.patch.object(soltop_dvfs, "_dvfs_cache_identity",
+                                            return_value=("Mac-test", "OS-test")):
+            with open(os.path.join(cache_dir, "dvfs.json"), "w") as f:
+                f.write('{"schema":999,"model":"Mac-test",'
+                        '"os_build":"OS-test","tables":{"unknown":true}}')
+            with unittest.mock.patch.object(soltop_dvfs, "_read_voltage_state_tables",
+                                            return_value=raw) as read:
+                tables = soltop_dvfs.load_dvfs()
+            self.assertEqual(read.call_count, 1)
+            self.assertIn("voltage-states1", tables)
+            with open(os.path.join(cache_dir, "dvfs.json")) as f:
+                self.assertIn('"schema":1', f.read())
+
     def test_m5_core_names_group_into_the_real_clusters(self):
         # The core naming is chip-specific and the letters INVERT between chips:
         #   M4 Pro:  ECPU000..ECPU030   PCPU000..PCPU140
@@ -1168,7 +1186,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.11.2")
+        self.assertEqual(soltop.__version__, "0.11.3")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200

@@ -153,8 +153,10 @@ def _load_dvfs_cache():
     try:
         with open(_dvfs_cache_path(), encoding="utf-8") as f:
             cached = json.load(f)
-        if (cached.get("schema"), cached.get("model"), cached.get("os_build")) != (
-                _CACHE_SCHEMA, identity[0], identity[1]):
+        # Reject an unknown format before looking at any version-specific fields.
+        if cached.get("schema") != _CACHE_SCHEMA:
+            return None
+        if (cached.get("model"), cached.get("os_build")) != identity:
             return None
         return _valid_cached_tables(cached.get("tables"))
     except (OSError, ValueError, TypeError, AttributeError, UnicodeError):

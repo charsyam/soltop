@@ -2,7 +2,7 @@
 
 [![test](https://github.com/charsyam/soltop/actions/workflows/test.yml/badge.svg)](https://github.com/charsyam/soltop/actions/workflows/test.yml)
 
-Current version: **0.11.2**
+Current version: **0.11.3**
 
 **Which process is eating my GPU?** On Apple Silicon that question is
 surprisingly hard to answer. `soltop` answers it — with a per-process GPU table
@@ -157,8 +157,10 @@ src/soltop/
 packs the tree into one file, so there is still nothing to install but a script.
 
 The decoded DVFS tables are cached in `~/Library/Caches/soltop/dvfs.json` after
-the first run. The cache is keyed by Mac model and macOS build, and is safe to
-delete; soltop rebuilds it from IORegistry when missing, stale, or malformed.
+the first run. Its JSON payload carries a schema version and is also keyed by
+Mac model and macOS build. An unsupported schema is discarded and rebuilt from
+IORegistry, as is a missing, stale, or malformed cache; the file is always safe
+to delete.
 
 ## Requirements
 
