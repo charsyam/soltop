@@ -189,13 +189,17 @@ reasoning would have found that; the dump did, in one shot.
 - No `sudo` and no `powermetrics` dependency.
 - GPU utilization and power come from IOReport residency / energy counters;
   they track trends well but are approximations, not firmware-exact values.
-- **The per-process GPU times do not sum to the system-wide GPU%**, and are not
-  meant to. The two are measured differently: a process's figure is the GPU time
-  the driver *billed to that client*, while the system figure is hardware
-  P-state residency. Work the kernel does on its own, and anything the driver
-  does not attribute to a client, shows up in the second and not the first — so
-  the processes routinely account for only about half of the system total. Use
-  the table to rank *who* is on the GPU, and the gauge for *how busy* it is.
+- **The per-process GPU times are accurate, and under load they sum to the
+  system-wide GPU%.** Measured against a Metal compute kernel pinning the GPU on
+  an M4 Pro: the gauge reads 100% and the process rows add to 96–101%.
+
+  They diverge *at idle* — the processes come to roughly half the gauge — and
+  that is the two figures answering different questions rather than either being
+  wrong. The gauge is P-state residency: how long the GPU was **awake**. A
+  process's row is the time the driver **billed to that client**. Idle GPU work
+  (compositing, a stray frame) wakes the GPU for a moment, and the ramp in and
+  out counts as awake without being anyone's work. Under sustained load the GPU
+  never sleeps, that overhead vanishes, and the two agree.
 - The process table's **MEM** is the process's RSS. Apple Silicon memory is
   unified, so that *is* the memory it costs the SoC — the GPU driver publishes
   no separate VRAM figure (per GPU client it exposes only the API, the
