@@ -73,11 +73,11 @@ class LiveKeyTests(unittest.TestCase):
         real_render = soltop.render
 
         def spy(view, cols=80, gpu_hist=None, procs=None, height=None,
-                soc_hist=None, process_only=False, single_sample=False,
-                core_only=False):
+                soc_hist=None, temp_hist=None, process_only=False,
+                single_sample=False, core_only=False):
             seen.append(process_only)
             return real_render(view, cols, gpu_hist, procs, height, soc_hist,
-                               process_only, single_sample, core_only)
+                               temp_hist, process_only, single_sample, core_only)
 
         with unittest.mock.patch.object(soltop_ui, "Sampler", _FakeSampler), \
                 unittest.mock.patch.object(soltop_ui, "ProcGPUSampler", _FakeProcSampler), \
@@ -107,12 +107,12 @@ class LiveKeyTests(unittest.TestCase):
         real_render = soltop.render
 
         def spy(view, cols=80, gpu_hist=None, procs=None, height=None,
-                soc_hist=None, process_only=False, single_sample=False,
-                core_only=False):
+                soc_hist=None, temp_hist=None, process_only=False,
+                single_sample=False, core_only=False):
             seen.append("proc" if process_only
                         else "core" if core_only else "dash")
             return real_render(view, cols, gpu_hist, procs, height, soc_hist,
-                               process_only, single_sample, core_only)
+                               temp_hist, process_only, single_sample, core_only)
 
         with unittest.mock.patch.object(soltop_ui, "Sampler", _FakeSampler), \
                 unittest.mock.patch.object(soltop_ui, "ProcGPUSampler", _FakeProcSampler), \

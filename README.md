@@ -61,7 +61,9 @@ is excellent and is a single Rust binary. Reach for soltop when you need to know
   P0/P1 and an M5 Pro's S + P0/P1 both come out right.
 - **Power**: CPU / GPU / ANE / DRAM / Total (cur / avg / peak) + history graph
 - **Memory**: used / wired / compressed / swap
-- **SoC die temperature** (max / avg) + thermal / throttle state
+- **SoC die temperature** (max / avg) with a history graph — the thermal state
+  flag stays `nominal` while the die climbs 20 °C, so the trend is the early
+  warning the flag is not
 - **JSON / CSV / Prometheus** output for piping and dashboards
 - Auto-fits the terminal size, boxed asitop-style UI
 

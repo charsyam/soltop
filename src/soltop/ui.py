@@ -262,6 +262,7 @@ def render_cores(view, width, limit=None):
 
 
 def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
+           temp_hist=None,
            process_only=False, single_sample=False, core_only=False):
     """Draw the organize() result (view). Does no data-structure reasoning.
 
@@ -351,6 +352,28 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
                                 label_max=scale, label_unit="W",
                                 color="\x1b[1;92m"))
         lines.append(f"  {comp}" + ("" if single_sample else "   (cur/avg/peak)"))
+        lines.append("")
+
+    # SoC die temperature. Worth a graph of its own: the thermal state stays
+    # 'nominal' while the die climbs 20 C, so the trend is the early warning the
+    # state flag is not. NOT a GPU temperature -- see core/temps.py.
+    temp = view.get("soc_temp") or {}
+    if temp:
+        hot = temp["max"]
+        tcol = "\x1b[1;92m" if hot < 70 else "\x1b[1;93m" if hot < 90 else "\x1b[1;91m"
+        tstats = ""
+        if not single_sample and temp_hist:
+            tstats = (f"  (avg {sum(temp_hist) / len(temp_hist):.0f}°C"
+                      f"  peak {max(temp_hist):.0f}°C)")
+        lines.append(f"{HEADER} SoC Temp: {hot:.1f}°C{tstats}"
+                     f"   (die max; avg {temp['avg']:.1f}°C){RESET}")
+        if temp_hist is not None:
+            # 100 C full-scale: Apple Silicon throttles hard well before this, so
+            # the top of the graph is the wall you do not want to reach.
+            scale = 100.0
+            norm = [min(100.0, (c / scale) * 100) for c in temp_hist]
+            lines.extend(vgraph(norm, height=GRAPH_HEIGHT, width=max(10, width - 7),
+                                label_max=scale, label_unit="C", color=tcol))
         lines.append("")
 
     # Memory: asitop-style gauge + text breakdown (wired / compressed / swap).
@@ -444,6 +467,7 @@ def live(interval=1.0, cols_override=None):
     proc_sampler = ProcGPUSampler()
     gpu_hist = deque(maxlen=200)
     soc_hist = deque(maxlen=200)
+    temp_hist = deque(maxlen=200)
     # Clear the whole screen only once; afterwards just move the cursor home
     # and overwrite in place to avoid flicker.
     print(HIDE_CURSOR + CLEAR, end="", flush=True)
@@ -474,6 +498,8 @@ def live(interval=1.0, cols_override=None):
                     continue
                 gpu_hist.append(view["gpu_pct"])
                 soc_hist.append(view.get("power", {}).get("SoC", 0) / 1000)
+                if view.get("soc_temp"):
+                    temp_hist.append(view["soc_temp"]["max"])
                 try:
                     procs = proc_sampler.step(interval)
                 except Exception:
@@ -497,8 +523,8 @@ def live(interval=1.0, cols_override=None):
                     print(CLEAR, end="")
                     last_size = (cols, rows)
                 frame = render(view, cols, gpu_hist, procs, height=rows,
-                               soc_hist=soc_hist, process_only=process_only,
-                               core_only=core_only)
+                               soc_hist=soc_hist, temp_hist=temp_hist,
+                               process_only=process_only, core_only=core_only)
                 # Overwrite the whole frame in one write, then clear any lines below.
                 print(HOME + frame + CLEAR_TO_END, end="", flush=True)
     except KeyboardInterrupt:
