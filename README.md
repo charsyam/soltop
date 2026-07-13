@@ -2,7 +2,7 @@
 
 [![test](https://github.com/charsyam/soltop/actions/workflows/test.yml/badge.svg)](https://github.com/charsyam/soltop/actions/workflows/test.yml)
 
-Current version: **0.8.0**
+Current version: **0.9.0**
 
 An Apple Silicon GPU / CPU / power monitor for the terminal — like `asitop`,
 but **without `sudo` and without `powermetrics`**.
@@ -77,6 +77,37 @@ CPU clusters down when idle) and a chip whose ladder soltop cannot read both hav
 *no* frequency — so JSON emits `null`, CSV leaves the field empty, and Prometheus
 **omits the series entirely**. A zero would average cleanly and drag a dashboard
 quietly towards nothing; an absent series is honest.
+
+## Development
+
+```sh
+PYTHONPATH=src python3 -m unittest test_soltop     # tests
+python3 -m zipapp src -o soltop -p "/usr/bin/env python3" -c   # what brew builds
+./soltop --version
+```
+
+The package is split by concern, and the layering is one-way:
+
+```
+src/soltop/
+  ffi.py            raw ctypes bindings (CoreFoundation, IOReport, IOKit, libc)
+  core/
+    dvfs.py         frequency ladders -- pure policy over the voltage-states tables
+    power.py        which Energy Model channels to read, and their sanity bounds
+    sampler.py      IOReport subscription; hands out raw residency/energy deltas
+    cpu.py          cluster grouping and E/P/S tier naming
+    gpu.py          GPU utilization and clock
+    process.py      per-process GPU time
+    system.py       memory, model name, thermal state
+    view.py         stitches cpu/gpu/power into the dict everything else consumes
+  exporter/         JSON, CSV, Prometheus
+  ui.py             terminal rendering and the live loop
+  cli.py            argument parsing
+```
+
+`sampler.py` only *reads*; what the numbers mean is decided in `cpu.py` /
+`gpu.py` / `power.py`. Homebrew ships this as a **single executable** — `zipapp`
+packs the tree into one file, so there is still nothing to install but a script.
 
 ## Requirements
 

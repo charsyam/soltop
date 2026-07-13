@@ -6,6 +6,13 @@ import unittest
 import unittest.mock
 
 import soltop
+from soltop import cli as soltop_cli
+from soltop import ui as soltop_ui
+from soltop.core import dvfs as soltop_dvfs
+from soltop.core import power as soltop_power
+from soltop.core import sampler as soltop_sampler
+from soltop.core import process as soltop_proc
+from soltop.exporter import formats as soltop_formats
 
 
 def _has_ioreport():
@@ -71,11 +78,11 @@ class LiveKeyTests(unittest.TestCase):
             return real_render(view, cols, gpu_hist, procs, height, soc_hist,
                                process_only, single_sample, core_only)
 
-        with unittest.mock.patch.object(soltop, "Sampler", _FakeSampler), \
-                unittest.mock.patch.object(soltop, "ProcGPUSampler", _FakeProcSampler), \
-                unittest.mock.patch.object(soltop, "KeyReader", lambda s: _FakeKeys(keys)), \
-                unittest.mock.patch.object(soltop.time, "sleep", lambda s: None), \
-                unittest.mock.patch.object(soltop, "render", spy), \
+        with unittest.mock.patch.object(soltop_ui, "Sampler", _FakeSampler), \
+                unittest.mock.patch.object(soltop_ui, "ProcGPUSampler", _FakeProcSampler), \
+                unittest.mock.patch.object(soltop_ui, "KeyReader", lambda s: _FakeKeys(keys)), \
+                unittest.mock.patch.object(soltop_ui.time, "sleep", lambda s: None), \
+                unittest.mock.patch.object(soltop_ui, "render", spy), \
                 unittest.mock.patch("sys.stdout", new_callable=io.StringIO):
             soltop.live(interval=0.01)
         return seen
@@ -106,11 +113,11 @@ class LiveKeyTests(unittest.TestCase):
             return real_render(view, cols, gpu_hist, procs, height, soc_hist,
                                process_only, single_sample, core_only)
 
-        with unittest.mock.patch.object(soltop, "Sampler", _FakeSampler), \
-                unittest.mock.patch.object(soltop, "ProcGPUSampler", _FakeProcSampler), \
-                unittest.mock.patch.object(soltop, "KeyReader", lambda s: _FakeKeys(keys)), \
-                unittest.mock.patch.object(soltop.time, "sleep", lambda s: None), \
-                unittest.mock.patch.object(soltop, "render", spy), \
+        with unittest.mock.patch.object(soltop_ui, "Sampler", _FakeSampler), \
+                unittest.mock.patch.object(soltop_ui, "ProcGPUSampler", _FakeProcSampler), \
+                unittest.mock.patch.object(soltop_ui, "KeyReader", lambda s: _FakeKeys(keys)), \
+                unittest.mock.patch.object(soltop_ui.time, "sleep", lambda s: None), \
+                unittest.mock.patch.object(soltop_ui, "render", spy), \
                 unittest.mock.patch("sys.stdout", new_callable=io.StringIO):
             soltop.live(interval=0.01)
         return seen
@@ -156,7 +163,7 @@ class LiveRecoveryTests(unittest.TestCase):
                 return "q" if calls["n"] > 3 else ""
 
         with unittest.mock.patch.object(soltop.Sampler, "read", flaky), \
-                unittest.mock.patch.object(soltop, "KeyReader", lambda s: Keys()), \
+                unittest.mock.patch.object(soltop_ui, "KeyReader", lambda s: Keys()), \
                 unittest.mock.patch("sys.stdout", new_callable=io.StringIO):
             soltop.live(interval=0.01)      # must not raise
         self.assertGreater(calls["n"], 2, "should have sampled past the failure")
@@ -185,8 +192,8 @@ class LiveRecoveryTests(unittest.TestCase):
                 return ""
 
         with unittest.mock.patch.object(soltop.Sampler, "read", always_fail), \
-                unittest.mock.patch.object(soltop, "KeyReader", lambda s: Keys()), \
-                unittest.mock.patch.object(soltop.time, "sleep", lambda s: None), \
+                unittest.mock.patch.object(soltop_ui, "KeyReader", lambda s: Keys()), \
+                unittest.mock.patch.object(soltop_ui.time, "sleep", lambda s: None), \
                 unittest.mock.patch("sys.stdout", new_callable=io.StringIO):
             with self.assertRaises(RuntimeError):
                 soltop.live(interval=0.01)
@@ -197,7 +204,7 @@ class LiveRecoveryTests(unittest.TestCase):
             raise RuntimeError("subscription failed")
 
         err = io.StringIO()
-        with unittest.mock.patch.object(soltop, "Sampler", boom), \
+        with unittest.mock.patch.object(soltop_cli, "Sampler", boom), \
                 unittest.mock.patch.object(sys, "argv", ["soltop", "--once"]), \
                 unittest.mock.patch.object(sys, "stderr", err):
             self.assertEqual(soltop.main(), 1)
@@ -406,9 +413,9 @@ class ProcGPUSamplerTests(unittest.TestCase):
     def _step_twice(self, snaps):
         """Run two steps over canned snapshots with 1s of simulated elapsed."""
         ps = soltop.ProcGPUSampler()
-        with unittest.mock.patch.object(soltop, "_gpu_client_totals",
+        with unittest.mock.patch.object(soltop_proc, "_gpu_client_totals",
                                         side_effect=snaps), \
-                unittest.mock.patch.object(soltop, "_attach_proc_stats",
+                unittest.mock.patch.object(soltop_proc, "_attach_proc_stats",
                                            lambda rows: None):
             ps.step()                       # baseline
             ps.prev_time -= 1.0             # pretend 1s elapsed
@@ -431,7 +438,7 @@ class ProcGPUSamplerTests(unittest.TestCase):
         # would read ~17,000,000 ms/s).
         ps = soltop.ProcGPUSampler()
         with unittest.mock.patch.object(
-                soltop, "_gpu_client_totals",
+                soltop_proc, "_gpu_client_totals",
                 return_value={1: ("WindowServer", 17_000_000_000_000)}):
             self.assertEqual(ps.step(), [])
 
@@ -721,12 +728,12 @@ class SoltopLogicTests(unittest.TestCase):
             states.update({f"V{i}P{nsteps - 1 - i}": 1 for i in range(nsteps)})
             return [{"name": n, "active": 0.0, "states": dict(states)} for n in names]
 
-        saved = soltop.DVFS
+        saved = soltop_dvfs.DVFS
         try:
             # M5 Pro: 1-digit names are core indices within ONE cluster, and the
             # 20-step tier (4608 MHz) outranks the 15-step one (4380) -> S over P.
-            soltop.DVFS = {"voltage-states5": ("period", [1308.0] + [4608.0] * 19),
-                           "voltage-states22": ("period", [1344.0] + [4380.0] * 14)}
+            soltop_dvfs.set_tables({"voltage-states5": ("period", [1308.0] + [4608.0] * 19),
+                           "voltage-states22": ("period", [1344.0] + [4380.0] * 14)})
             m5 = soltop.group_clusters(cores([f"PCPU{i}" for i in range(5)], 20) +
                                        cores([f"MCPU{c}{i}" for c in (0, 1)
                                               for i in range(5)], 15))
@@ -735,8 +742,8 @@ class SoltopLogicTests(unittest.TestCase):
 
             # M4 Pro: 3-digit names carry a leading CLUSTER index, and the slow
             # tier (2592) is far below the fast one (4512) -> a real E-cluster.
-            soltop.DVFS = {"voltage-states1": ("period", [1020.0] + [2592.0] * 6),
-                           "voltage-states5": ("period", [1260.0] + [4512.0] * 18)}
+            soltop_dvfs.set_tables({"voltage-states1": ("period", [1020.0] + [2592.0] * 6),
+                           "voltage-states5": ("period", [1260.0] + [4512.0] * 18)})
             m4 = soltop.group_clusters(cores([f"ECPU0{i}0" for i in range(4)], 7) +
                                        cores([f"PCPU{c}{i}0" for c in (0, 1)
                                               for i in range(5)], 19))
@@ -747,7 +754,7 @@ class SoltopLogicTests(unittest.TestCase):
             self.assertEqual(
                 [c["key"] for c in soltop.group_clusters(cores(["WEIRD"], 3))], ["?"])
         finally:
-            soltop.DVFS = saved
+            soltop_dvfs.set_tables(saved)
 
     def test_tier_labels_come_from_the_ladder_not_the_name(self):
         # 'PCPU' means Performance on an M4 and Super on an M5, so the letter in
@@ -800,12 +807,12 @@ class SoltopLogicTests(unittest.TestCase):
         # (which counts in uJ) and drive a real Sampler.read: the GPU must report
         # nothing rather than the ~272 kW that channel reads as.
         sampler = soltop.Sampler()
-        saved = soltop.ENERGY_KEYS
+        saved = soltop_sampler.ENERGY_KEYS
         try:
-            soltop.ENERGY_KEYS = {"CPU Energy": "CPU", "GPU Energy": "GPU"}
+            soltop_sampler.ENERGY_KEYS = {"CPU Energy": "CPU", "GPU Energy": "GPU"}
             power = sampler.read(0.3)["power"]
         finally:
-            soltop.ENERGY_KEYS = saved
+            soltop_sampler.ENERGY_KEYS = saved
             sampler.close()
 
         # 'GPU Energy' is real and non-zero on this machine, but implausible as
@@ -880,9 +887,9 @@ class SoltopLogicTests(unittest.TestCase):
         # An exporter is a long-lived process. Failing to read the machine's name
         # or its thermal state must not take the whole metric stream down --
         # those are labels, not measurements.
-        with unittest.mock.patch.object(soltop, "machine_name",
+        with unittest.mock.patch.object(soltop_formats, "machine_name",
                                         side_effect=Exception("boom")), \
-                unittest.mock.patch.object(soltop, "thermal_state",
+                unittest.mock.patch.object(soltop_formats, "thermal_state",
                                            side_effect=Exception("boom")):
             snap = soltop.snapshot(self._export_view(), timestamp=1234.5)
 
@@ -912,10 +919,10 @@ class SoltopLogicTests(unittest.TestCase):
         cores = [{"name": "XCPU00", "subgroup": sub, "active": 0.5,
                   "states": {"IDLE": 50, "V0P1": 25, "V1P0": 25}}]
 
-        saved = soltop.DVFS
+        saved = soltop_dvfs.DVFS
         try:
             # No tables at all (a future chip that renames voltage-states*).
-            soltop.DVFS = {}
+            soltop_dvfs.set_tables({})
             v = soltop.organize({"gpu": [], "cpu": cores})
             c = v["clusters"][0]
             self.assertEqual(c["mhz"], 0.0)
@@ -924,12 +931,12 @@ class SoltopLogicTests(unittest.TestCase):
             self.assertEqual(c["avg"], 50.0)
 
             # Tables exist but none has this cluster's step count: still no clock.
-            soltop.DVFS = {"voltage-states5": ("period", [1000.0] * 19)}
+            soltop_dvfs.set_tables({"voltage-states5": ("period", [1000.0] * 19)})
             c = soltop.organize({"gpu": [], "cpu": cores})["clusters"][0]
             self.assertEqual(c["mhz"], 0.0)
             self.assertEqual(c["avg"], 50.0)
         finally:
-            soltop.DVFS = saved
+            soltop_dvfs.set_tables(saved)
 
     def test_m5_pro_18_core_variant(self):
         # The 18-core M5 Pro is 6 Super + 12 Performance. The layout is derived
@@ -942,17 +949,17 @@ class SoltopLogicTests(unittest.TestCase):
             return [{"name": n, "subgroup": "CPU Core Performance States",
                      "active": 0.0, "states": dict(states)} for n in names]
 
-        saved = soltop.DVFS
+        saved = soltop_dvfs.DVFS
         try:
-            soltop.DVFS = {"voltage-states5": ("period", [1308.0] + [4608.0] * 19),
-                           "voltage-states22": ("period", [1344.0] + [4380.0] * 14)}
+            soltop_dvfs.set_tables({"voltage-states5": ("period", [1308.0] + [4608.0] * 19),
+                           "voltage-states22": ("period", [1344.0] + [4380.0] * 14)})
             got = soltop.group_clusters(
                 cores([f"PCPU{i}" for i in range(6)], 20) +
                 cores([f"MCPU{c}{i}" for c in (0, 1) for i in range(6)], 15))
             self.assertEqual([(c["key"], len(c["cores"])) for c in got],
                              [("S", 6), ("P0", 6), ("P1", 6)])
         finally:
-            soltop.DVFS = saved
+            soltop_dvfs.set_tables(saved)
 
     def test_m5_pro_topology_end_to_end(self):
         # An M5 Pro as powermetrics reports it: an S-cluster and TWO P-clusters,
@@ -975,15 +982,15 @@ class SoltopLogicTests(unittest.TestCase):
                  "states": states(15, 99, {"IDLE": 1})} for i in range(5)] +
                [{"name": f"MCPU1{i}", "subgroup": sub, "active": 0.0,
                  "states": states(15, 0, {"DOWN": 100})} for i in range(5)]}
-        saved = soltop.DVFS
-        soltop.DVFS = {
+        saved = soltop_dvfs.DVFS
+        soltop_dvfs.set_tables({
             "voltage-states5": ("period", [1308.0] + [4608.0] * 19),    # 20 steps
             "voltage-states22": ("period", [1344.0] + [4380.0] * 14),   # 15 steps
-        }
+        })
         try:
             got = {c["key"]: c for c in soltop.organize(raw)["clusters"]}
         finally:
-            soltop.DVFS = saved
+            soltop_dvfs.set_tables(saved)
 
         # The Super cluster is labelled S, not P, even though its cores are
         # named PCPU* -- the tier comes from the ladder ceiling (4608 > 4380).
@@ -1029,7 +1036,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.8.0")
+        self.assertEqual(soltop.__version__, "0.9.0")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200

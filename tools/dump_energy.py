@@ -27,8 +27,9 @@ import os
 import re
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 import soltop  # noqa: E402
+from soltop.core import sampler as _sampler  # noqa: E402
 
 # A laptop/desktop SoC package cannot plausibly draw more than this.
 SANE_MAX_W = 200.0
@@ -41,7 +42,7 @@ CLUSTER_RE = re.compile(r"^([EPS])ACC(\d*)_CPU$")
 def sample(seconds=1.0):
     """Return {channel_name: delta} for the Energy Model group."""
     captured = {}
-    orig = soltop.iter_channels
+    orig = _sampler.iter_channels
 
     def spy(delta):
         for ch in orig(delta):
@@ -52,13 +53,13 @@ def sample(seconds=1.0):
             yield ch
 
     s = soltop.Sampler()
-    soltop.iter_channels = spy
+    _sampler.iter_channels = spy
     try:
         s.read(0.3)          # prime
         captured.clear()
         s.read(seconds)
     finally:
-        soltop.iter_channels = orig
+        _sampler.iter_channels = orig
         s.close()
     return captured, seconds
 
@@ -103,7 +104,7 @@ def main():
 
     # --- 3. What soltop reports today, for comparison ------------------------
     print("\nsoltop's current hardcoded picks:")
-    for name, label in soltop.ENERGY_KEYS.items():
+    for name, label in _sampler.ENERGY_KEYS.items():
         present = "present" if name in chans else "ABSENT ON THIS CHIP"
         print(f"   {label:5s} <- {name!r:14s} {mW(name):10.1f} mW   ({present})")
 

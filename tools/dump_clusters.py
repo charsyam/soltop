@@ -15,14 +15,16 @@ No sudo.
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 import soltop  # noqa: E402
 
 
 def main():
-    soltop.DVFS = soltop.load_dvfs()
+    from soltop.core import dvfs as _dvfs
+    _dvfs.set_tables(soltop.load_dvfs())
+    tables = _dvfs.tables()
     print("decoded voltage-states tables:")
-    for key, (kind, ladder) in sorted(soltop.DVFS.items()):
+    for key, (kind, ladder) in sorted(tables.items()):
         print(f"  {key:24s} {kind:8s} {len(ladder):2d} steps  "
               f"{ladder[0]:.0f}..{ladder[-1]:.0f} MHz")
 
@@ -36,7 +38,7 @@ def main():
     print("\nclusters as soltop groups them:")
     for c in soltop.group_clusters(cores):
         nsteps = soltop._nsteps(c["cores"])
-        ladder = soltop.match_cpu_ladder(nsteps, soltop.DVFS)
+        ladder = soltop.match_cpu_ladder(nsteps, tables)
         avg = (sum(x["active"] for x in c["cores"]) / len(c["cores"]) * 100)
         mhz = soltop.cluster_freq_mhz(c["cores"], ladder)
         print(f"\n  {c['key']:3s} {c['label']:16s} cores={len(c['cores'])} "
@@ -53,7 +55,7 @@ def main():
     gpu = raw.get("gpu", [])
     if gpu:
         gsteps = soltop._nsteps(gpu)
-        gladder = soltop.match_gpu_ladder(soltop.DVFS)
+        gladder = soltop.match_gpu_ladder(tables)
         top = f"{gladder[-1]:.0f}" if gladder else "-"
         print(f"\n  GPU nsteps={gsteps} ladder={len(gladder)} steps (top {top} MHz)  "
               f"mhz={soltop.cluster_freq_mhz(gpu, gladder):.0f}")
