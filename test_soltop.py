@@ -73,12 +73,13 @@ class LiveKeyTests(unittest.TestCase):
         real_render = soltop.render
 
         def spy(view, cols=80, gpu_hist=None, procs=None, height=None,
-                soc_hist=None, temp_hist=None, process_only=False,
-                single_sample=False, core_only=False, temp_only=False):
+                soc_hist=None, temp_hist=None, ane_hist=None,
+                process_only=False, single_sample=False, core_only=False,
+                temp_only=False):
             seen.append(process_only)
             return real_render(view, cols, gpu_hist, procs, height, soc_hist,
-                               temp_hist, process_only, single_sample, core_only,
-                               temp_only)
+                               temp_hist, ane_hist, process_only, single_sample,
+                               core_only, temp_only)
 
         with unittest.mock.patch.object(soltop_ui, "Sampler", _FakeSampler), \
                 unittest.mock.patch.object(soltop_ui, "ProcGPUSampler", _FakeProcSampler), \
@@ -108,14 +109,15 @@ class LiveKeyTests(unittest.TestCase):
         real_render = soltop.render
 
         def spy(view, cols=80, gpu_hist=None, procs=None, height=None,
-                soc_hist=None, temp_hist=None, process_only=False,
-                single_sample=False, core_only=False, temp_only=False):
+                soc_hist=None, temp_hist=None, ane_hist=None,
+                process_only=False, single_sample=False, core_only=False,
+                temp_only=False):
             seen.append("proc" if process_only
                         else "core" if core_only
                         else "temp" if temp_only else "dash")
             return real_render(view, cols, gpu_hist, procs, height, soc_hist,
-                               temp_hist, process_only, single_sample, core_only,
-                               temp_only)
+                               temp_hist, ane_hist, process_only, single_sample,
+                               core_only, temp_only)
 
         with unittest.mock.patch.object(soltop_ui, "Sampler", _FakeSampler), \
                 unittest.mock.patch.object(soltop_ui, "ProcGPUSampler", _FakeProcSampler), \
@@ -957,6 +959,34 @@ class SoltopLogicTests(unittest.TestCase):
         for name in ("PMU tcal", "gas gauge battery", "NAND CH0 temp", "GPU"):
             self.assertIsNone(soltop_temps._DIE_RE.match(name), name)
 
+    def test_ane_is_reported_as_power_not_utilization(self):
+        # IOReport exposes NO ANE duty cycle. The only channels that move under
+        # an ANE load are voltage/bandwidth FLOOR states (ANE-FAST-AF-BW and
+        # friends) -- they correlate with activity but are not a utilization
+        # percentage, and rendering one as "ANE 76%" would be the same lie as
+        # calling a process's RSS its "GPU memory".
+        #
+        # The power rail, though, is unambiguous: measured against a Vision
+        # workload on an M4 Pro it reads exactly 0 mW idle and ~1.9 W flat out.
+        # So report the wattage, and say in the view that it is not a duty cycle.
+        view = dict(self._export_view())
+        view["power"] = {"ANE": 1870.0, "CPU": 1360.0}
+        view["soc_temp"] = {"avg": 46.0, "max": 50.0}
+
+        busy = "\n".join(soltop.render_soc(view, 76, temp_hist=[50.0],
+                                           ane_hist=[1.87]))
+        self.assertIn("1.87W", busy)
+        self.assertIn("running", busy)
+        self.assertIn("not utilization", busy)   # the caveat is on screen
+        self.assertNotIn("ANE 76%", busy)
+
+        # 0 W is the honest 'idle' signal, not a missing reading.
+        view["power"] = {"ANE": 0.0}
+        idle = "\n".join(soltop.render_soc(view, 76, temp_hist=[50.0],
+                                           ane_hist=[0.0]))
+        self.assertIn("0.00W", idle)
+        self.assertIn("idle", idle)
+
     def test_serve_address_parsing(self):
         # A bare port must NOT bind every interface: exporting hardware telemetry
         # to the network should be a deliberate act.
@@ -1093,7 +1123,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.10.1")
+        self.assertEqual(soltop.__version__, "0.11.0")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200

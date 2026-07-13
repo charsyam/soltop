@@ -252,44 +252,91 @@ def _temp_txt(temp, temp_hist=None, single_sample=False):
             f"   (die max; avg {temp['avg']:.1f}°C)")
 
 
-def render_temp(view, width, temp_hist=None, height=None):
-    """The 't' view: the die temperature, its history, and the raw sensors.
+ANE_SCALE_W = 4.0
+"""Full-scale for the ANE power graph, in watts.
 
-    The dashboard only has room for the one-line summary. This is where the
-    trend lives -- and the trend is the point, because thermal_state() reports
-    'nominal' the whole way from 51 C to 77 C.
+An M4 Pro's ANE draws ~1.9 W flat out on a Vision workload, so 4 W keeps a busy
+ANE around half-height rather than flattened along the axis, while leaving
+headroom for the larger parts.
+"""
+
+
+def render_soc(view, width, temp_hist=None, ane_hist=None, height=None):
+    """The 't' view: the SoC's two blind spots -- die temperature and the ANE.
+
+    Both are things the dashboard has no room to graph, and both answer a
+    question nothing else on screen does:
+
+      * the die temperature trend, because thermal_state() reports 'nominal' the
+        whole way from 51 C to 77 C, so the flag is not an early warning;
+      * whether the Neural Engine is running at all. There is no ANE utilization
+        counter in IOReport (see below), but its power rail reads exactly 0 mW
+        when idle, so the wattage answers 'is the ANE doing anything?' cleanly.
     """
+    lines = []
+
+    # --- ANE ---------------------------------------------------------------
+    # Deliberately power, not a utilization %. IOReport exposes no ANE residency
+    # channel: the only things that move under an ANE load are voltage/bandwidth
+    # FLOOR states (ANE-FAST-AF-BW and friends), which correlate with activity
+    # but are not a duty cycle. Rendering one as "ANE 76%" would be the same lie
+    # as calling a process's RSS its "GPU memory" -- so report what we can
+    # actually measure. Verified against a Vision workload on an M4 Pro: 0 mW
+    # idle, ~1.9 W flat out.
+    ane_w = view.get("power", {}).get("ANE", 0) / 1000
+    busy = ane_w > 0.01
+    acol = "\x1b[1;92m" if busy else "\x1b[2m"
+    state = "running" if busy else "idle"
+    stats = ""
+    if ane_hist:
+        stats = (f"   (avg {sum(ane_hist) / len(ane_hist):.2f}W"
+                 f"  peak {max(ane_hist):.2f}W)")
+    lines.append(f"{HEADER} Neural Engine: {acol}{ane_w:.2f}W{RESET}"
+                 f"{HEADER} — {state}{stats}{RESET}")
+    if ane_hist is not None:
+        norm = [min(100.0, (w / ANE_SCALE_W) * 100) for w in ane_hist]
+        lines.extend(vgraph(norm, height=GRAPH_HEIGHT, width=max(10, width - 7),
+                            label_max=ANE_SCALE_W, label_unit="W",
+                            color="\x1b[1;92m"))
+    lines.append("  \x1b[2mPower, not utilization -- IOReport has no ANE duty "
+                 "cycle. 0 W = idle.\x1b[0m")
+    lines.append("")
+
+    # --- Die temperature ---------------------------------------------------
     temp = view.get("soc_temp") or {}
     if not temp:
-        return [f"{HEADER} SoC Temperature{RESET}",
-                "  \x1b[2m(no die sensor readable on this machine)\x1b[0m"]
+        lines.append(f"{HEADER} SoC Temperature{RESET}")
+        lines.append("  \x1b[2m(no die sensor readable on this machine)\x1b[0m")
+        return lines
 
-    lines = [f"{HEADER} SoC Temp: {_temp_txt(temp, temp_hist)}{RESET}", ""]
+    lines.append(f"{HEADER} SoC Temp: {_temp_txt(temp, temp_hist)}{RESET}")
     if temp_hist:
         # 100 C full-scale: the top of the graph is the wall you do not want to
         # reach, so the bar height reads as "how close am I".
         norm = [min(100.0, c) for c in temp_hist]
-        lines.extend(vgraph(norm, height=GRAPH_HEIGHT + 4,
-                            width=max(10, width - 7),
+        lines.extend(vgraph(norm, height=GRAPH_HEIGHT, width=max(10, width - 7),
                             label_max=100.0, label_unit="C",
                             color=_temp_color(temp["max"])))
-        lines.append("")
+    lines.append("  \x1b[2mThe SoC die, not the GPU -- no GPU-specific sensor "
+                 "exists. Pinning the GPU\x1b[0m")
+    lines.append("  \x1b[2mmoves these ~+1°C; pinning the CPU, ~+13°C.\x1b[0m")
 
-    # The raw sensors. The same physical sensor is published by several HID
-    # services, so identical readings repeating is expected, not a bug.
+    # The raw sensors, if there is room. The same physical sensor is published by
+    # several HID services, so identical readings repeating is expected.
     readings = sorted(die_temps(), reverse=True)
-    if readings:
+    used = len(lines) + 4
+    if readings and (height is None or height - used > 3):
+        lines.append("")
         lines.append(f"{HEADER} Die sensors ({len(readings)} readings){RESET}")
         per_row = max(1, (width - 2) // 9)
+        rows_left = 99 if height is None else max(0, height - used - 2)
         for i in range(0, len(readings), per_row):
-            chunk = readings[i:i + per_row]
+            if rows_left <= 0:
+                break
             lines.append("  " + " ".join(
-                f"{_temp_color(c)}{c:5.1f}°C{RESET}" for c in chunk))
-    lines.append("")
-    lines.append("  \x1b[2mThe SoC die, not the GPU -- no GPU-specific sensor "
-                 "exists.\x1b[0m")
-    lines.append("  \x1b[2mPinning the GPU moves these ~+1°C; the CPU, ~+13°C."
-                 "\x1b[0m")
+                f"{_temp_color(c)}{c:5.1f}°C{RESET}"
+                for c in readings[i:i + per_row]))
+            rows_left -= 1
     return lines
 
 
@@ -328,7 +375,7 @@ def render_cores(view, width, limit=None):
 
 
 def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
-           temp_hist=None,
+           temp_hist=None, ane_hist=None,
            process_only=False, single_sample=False, core_only=False,
            temp_only=False):
     """Draw the organize() result (view). Does no data-structure reasoning.
@@ -377,11 +424,11 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
         return _fit(lines, title)
 
     if temp_only:
-        title = f"Soltop v{__version__} · SoC Temperature · t: dashboard · q: quit"
-        lines.extend(render_temp(view, width, temp_hist, height=height))
+        title = f"Soltop v{__version__} · SoC Detail · t: dashboard · q: quit"
+        lines.extend(render_soc(view, width, temp_hist, ane_hist, height=height))
         return _fit(lines, title)
 
-    title += "   p: processes   c: cores   t: temp   q: quit"
+    title += "   p: processes   c: cores   t: soc   q: quit"
 
     freq_txt = _freq_txt(view.get("gpu_mhz", 0.0))
     cur = view["gpu_pct"]
@@ -528,6 +575,7 @@ def live(interval=1.0, cols_override=None):
     gpu_hist = deque(maxlen=200)
     soc_hist = deque(maxlen=200)
     temp_hist = deque(maxlen=200)
+    ane_hist = deque(maxlen=200)
     # Clear the whole screen only once; afterwards just move the cursor home
     # and overwrite in place to avoid flicker.
     print(HIDE_CURSOR + CLEAR, end="", flush=True)
@@ -561,6 +609,7 @@ def live(interval=1.0, cols_override=None):
                 soc_hist.append(view.get("power", {}).get("SoC", 0) / 1000)
                 if view.get("soc_temp"):
                     temp_hist.append(view["soc_temp"]["max"])
+                ane_hist.append(view.get("power", {}).get("ANE", 0) / 1000)
                 try:
                     procs = proc_sampler.step(interval)
                 except Exception:
@@ -588,6 +637,7 @@ def live(interval=1.0, cols_override=None):
                     last_size = (cols, rows)
                 frame = render(view, cols, gpu_hist, procs, height=rows,
                                soc_hist=soc_hist, temp_hist=temp_hist,
+                               ane_hist=ane_hist,
                                process_only=process_only, core_only=core_only,
                                temp_only=temp_only)
                 # Overwrite the whole frame in one write, then clear any lines below.

@@ -2,7 +2,7 @@
 
 [![test](https://github.com/charsyam/soltop/actions/workflows/test.yml/badge.svg)](https://github.com/charsyam/soltop/actions/workflows/test.yml)
 
-Current version: **0.10.1**
+Current version: **0.11.0**
 
 **Which process is eating my GPU?** On Apple Silicon that question is
 surprisingly hard to answer. `soltop` answers it — with a per-process GPU table
@@ -64,6 +64,9 @@ is excellent and is a single Rust binary. Reach for soltop when you need to know
 - **SoC die temperature** (max / avg), with a history graph behind `t` — the
   thermal state flag stays `nominal` while the die climbs 20 °C, so the trend is
   the early warning the flag is not
+- **Neural Engine** activity (behind `t`) — its power rail reads exactly 0 W when
+  idle, so the wattage answers "is the ANE running?" cleanly. Reported as power,
+  **not** a utilization %: IOReport exposes no ANE duty cycle at all
 - **JSON / CSV / Prometheus** output for piping and dashboards
 - Auto-fits the terminal size, boxed asitop-style UI
 
@@ -88,7 +91,7 @@ While running:
 |-----|--------|
 | `p` | toggle the full GPU process list |
 | `c` | toggle the per-core CPU view (every E/P core individually, instead of the cluster averages) |
-| `t` | toggle the SoC temperature view — history graph and every die sensor |
+| `t` | toggle the SoC detail view — Neural Engine power and the die temperature, with history graphs |
 | `q` | quit (`Ctrl-C` also works) |
 
 Pressing the same key again returns to the dashboard.
@@ -204,6 +207,13 @@ reasoning would have found that; the dump did, in one shot.
   (compositing, a stray frame) wakes the GPU for a moment, and the ramp in and
   out counts as awake without being anyone's work. Under sustained load the GPU
   never sleeps, that overhead vanishes, and the two agree.
+- **The ANE figure is power, not utilization** — because a utilization number
+  does not exist. IOReport has no ANE residency channel: the only things that
+  move under an ANE load are voltage and bandwidth *floor* states, which
+  correlate with activity but are not a duty cycle. Rendering one as "ANE 76%"
+  would be the same lie as calling a process's RSS its "GPU memory". The power
+  rail is unambiguous — measured against a Vision workload on an M4 Pro it reads
+  exactly **0 mW idle** and **~1.9 W** flat out.
 - **The temperature is the SoC die, not the GPU** — and no tool can give you a
   real GPU temperature on this hardware. There is no GPU-specific sensor: pinning
   the GPU with a Metal compute kernel on an M4 Pro moves the die sensors by about

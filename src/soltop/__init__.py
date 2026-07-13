@@ -10,7 +10,7 @@
 need not know which module a name lives in.
 """
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"
 
 from .ffi import CF, IOR, IOKIT, cfstr, from_cfstr
 
@@ -50,6 +50,6 @@ from .ui import (
     GRAPH_HEIGHT, HEADER, KeyReader, LIVE_MAX_RETRIES, RESET, _ANSI_RE,
     _fmt_bytes, _freq_txt, _truncate_visible, _visible_len, bar_width_for,
     bracket_gauge, color_for, gauge_bar, hgauge, live, render, render_cores,
-    render_procs, term_size, vgraph, wrap_box,
+    render_procs, render_soc, term_size, vgraph, wrap_box, ANE_SCALE_W,
 )
 from .cli import main
