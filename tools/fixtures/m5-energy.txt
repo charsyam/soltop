@@ -1,0 +1,76 @@
+sampled 314 Energy Model channels over 1.0s
+
+CPU, by cluster (this is what soltop could DISCOVER rather than name):
+   sum                  0.0 mW
+   CPU Energy         786.0 mW   (the aggregate soltop uses today)
+   sum / aggregate = 0.000   <- MISMATCH
+
+every channel, read as mJ -> mW. A value far above a plausible SoC
+budget (200 W) is NOT in mJ, and must not be used as power:
+   GPU Energy                2833000.0 mW  =  2833.000 W  <-- IMPLAUSIBLE (different unit)
+   CPU Energy                    786.0 mW  =     0.786 W
+   MCPU0                         700.0 mW  =     0.700 W
+   AMCC                          121.0 mW  =     0.121 W
+   FAB                           120.0 mW  =     0.120 W
+   MCPU0_2                       106.0 mW  =     0.106 W
+   MCPU0_4                       104.0 mW  =     0.104 W
+   MCPU0_3                       102.0 mW  =     0.102 W
+   MCPU0_1                        96.0 mW  =     0.096 W
+   MCPU0_0                        93.0 mW  =     0.093 W
+   PCPU                           86.0 mW  =     0.086 W
+   DRAM                           79.0 mW  =     0.079 W
+   MCPM0                          77.0 mW  =     0.077 W
+   MCPU0DTL20                     72.0 mW  =     0.072 W
+   MCPU0DTL40                     72.0 mW  =     0.072 W
+   MCPU0DTL30                     69.0 mW  =     0.069 W
+   MCPU0DTL10                     60.0 mW  =     0.060 W
+   DISP                           58.0 mW  =     0.058 W
+   MCPU0DTL00                     57.0 mW  =     0.057 W
+   DCS                            56.0 mW  =     0.056 W
+   PACC_0                         46.0 mW  =     0.046 W
+   MCPM0_SRAM                     30.0 mW  =     0.030 W
+   PCPM                           25.0 mW  =     0.025 W
+   MCPU0_2_SRAM                   19.0 mW  =     0.019 W
+   MCPU0_4_SRAM                   19.0 mW  =     0.019 W
+   MCPU0_1_SRAM                   18.0 mW  =     0.018 W
+   MCPU0_3_SRAM                   18.0 mW  =     0.018 W
+   MCPU0_0_SRAM                   17.0 mW  =     0.017 W
+   MCPU0DTL12                     13.0 mW  =     0.013 W
+   MCPU0DTL04                     12.0 mW  =     0.012 W
+   MCPU0DTL14                     12.0 mW  =     0.012 W
+   MCPU0DTL22                     12.0 mW  =     0.012 W
+   MCPU0DTL24                     12.0 mW  =     0.012 W
+   MCPU0DTL34                     12.0 mW  =     0.012 W
+   MCPU0DTL44                     12.0 mW  =     0.012 W
+   MCPU0DTL02                     11.0 mW  =     0.011 W
+   DISPEXT                        11.0 mW  =     0.011 W
+   MCPU0DTL32                     10.0 mW  =     0.010 W
+   MCPU0DTL42                     10.0 mW  =     0.010 W
+   MCPU0DTL43                      9.0 mW  =     0.009 W
+   MCPU0DTL03                      8.0 mW  =     0.008 W
+   MCPU0DTL13                      8.0 mW  =     0.008 W
+   MCPU0DTL23                      8.0 mW  =     0.008 W
+   MCPU0DTL33                      8.0 mW  =     0.008 W
+   PCPU0_SRAM                      6.0 mW  =     0.006 W
+   ISP                             6.0 mW  =     0.006 W
+   AVE                             6.0 mW  =     0.006 W
+   MSR                             6.0 mW  =     0.006 W
+   PACC_1                          5.0 mW  =     0.005 W
+   MCPU0DTL01                      4.0 mW  =     0.004 W
+   MCPU0DTL11                      4.0 mW  =     0.004 W
+   MCPU0DTL31                      4.0 mW  =     0.004 W
+   MCPU0DTL21                      3.0 mW  =     0.003 W
+   GPU                             3.0 mW  =     0.003 W
+   PCPM_SRAM                       2.0 mW  =     0.002 W
+   PCPUDTL313                      2.0 mW  =     0.002 W
+   PACC_2                          1.0 mW  =     0.001 W
+   PCPU1_SRAM                      1.0 mW  =     0.001 W
+   MCPU0DTL41                      1.0 mW  =     0.001 W
+   PCPUDTL113                      1.0 mW  =     0.001 W
+   AFR                             1.0 mW  =     0.001 W
+
+soltop's current hardcoded picks:
+   CPU   <- 'CPU Energy'        786.0 mW   (present)
+   GPU   <- 'GPU'                 3.0 mW   (present)
+   ANE   <- 'ANE'                 0.0 mW   (present)
+   DRAM  <- 'DRAM'               79.0 mW   (present)
