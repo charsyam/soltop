@@ -1,0 +1,48 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # Apple Silicon runners -- soltop reads IOReport, so an x86 runner would be
+    # pointless even if the pure-logic tests passed on one.
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.13"]   # the macOS system Python, and a current one
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Show the machine
+        run: |
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.nperflevels || true
+
+      - name: Compile
+        run: python3 -m compileall -q soltop.py tools/
+
+      - name: Test
+        run: python3 -m unittest test_soltop -v
+
+      - name: Smoke-test the real binary
+        run: |
+          python3 soltop.py --version
+          python3 soltop.py --once
+
+      - name: Diagnostics (informational -- a CI runner is virtualised, and its
+          IOReport may not look like real hardware's)
+        continue-on-error: true
+        run: |
+          python3 tools/dump_dvfs.py
+          python3 tools/dump_clusters.py
