@@ -774,6 +774,93 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertGreater(power["CPU"], 0.0)
         self.assertLessEqual(power["SoC"], soltop.POWER_SANE_MAX_MW)
 
+    def _export_view(self):
+        """A view with a live cluster and a parked one (the M5 Pro's P1)."""
+        return {
+            "gpu_pct": 29.4, "gpu_mhz": 618.0, "gpu_channels": [],
+            "clusters": [
+                {"key": "P0", "label": "CPU P0-cluster", "count": 5,
+                 "avg": 90.0, "mhz": 4380.0, "cores": [], "per_core": []},
+                {"key": "P1", "label": "CPU P1-cluster", "count": 5,
+                 "avg": 0.0, "mhz": 0.0, "cores": [], "per_core": []},
+            ],
+            "power": {"CPU": 1360.0, "GPU": 152.4, "SoC": 2110.0},
+        }
+
+    def test_export_never_reports_an_unknown_clock_as_zero(self):
+        # The whole point of soltop's degradation story, carried into the export:
+        # a parked cluster (macOS powers whole clusters down) and unreadable
+        # silicon both have NO clock. Exporting that as 0 would be a lie that
+        # averages cleanly -- a Grafana panel would quietly drag towards zero.
+        snap = soltop.snapshot(self._export_view(), timestamp=1234.5)
+
+        live, parked = snap["cpu_clusters"]
+        self.assertEqual(live["frequency_mhz"], 4380)
+        self.assertIsNone(parked["frequency_mhz"])     # null, NOT 0
+        self.assertTrue(parked["parked"])
+        self.assertFalse(live["parked"])
+
+        # JSON: null.
+        self.assertIn('"frequency_mhz":null', soltop.to_json(snap))
+
+        # CSV: an empty field, not a 0.
+        cols = soltop._csv_columns(snap)
+        row = soltop.to_csv_row(snap).split(",")
+        got = dict(zip(cols, row))
+        self.assertEqual(got["cpu_P0_frequency_mhz"], "4380")
+        self.assertEqual(got["cpu_P1_frequency_mhz"], "")
+
+        # Prometheus: the series is OMITTED. An absent series is honest; a zeroed
+        # one is not.
+        text = soltop.to_prometheus(snap)
+        self.assertIn('soltop_cpu_frequency_mhz{cluster="P0"} 4380', text)
+        self.assertNotIn('soltop_cpu_frequency_mhz{cluster="P1"}', text)
+        # ... but its utilization (a real 0%) IS exported.
+        self.assertIn('soltop_cpu_utilization_percent{cluster="P1"} 0.0', text)
+
+    def test_prometheus_output_is_well_formed(self):
+        text = soltop.to_prometheus(soltop.snapshot(self._export_view(), 1234.5))
+        lines = [l for l in text.splitlines() if l]
+        # Every metric carries HELP and TYPE before its samples.
+        for name in ("soltop_gpu_utilization_percent", "soltop_cpu_cores",
+                     "soltop_power_milliwatts"):
+            self.assertIn(f"# HELP {name} ", text)
+            self.assertIn(f"# TYPE {name} gauge", text)
+        # Labels are quoted, and no sample line is left with a bare trailing brace.
+        for line in lines:
+            if line.startswith("#"):
+                continue
+            self.assertRegex(line, r'^[a-z_]+(\{[a-z_]+="[^"]*"(,[a-z_]+="[^"]*")*\})? '
+                                   r'-?[0-9.]+$', line)
+        self.assertTrue(text.endswith("\n"))
+
+    def test_export_survives_a_failure_to_read_a_decorative_field(self):
+        # An exporter is a long-lived process. Failing to read the machine's name
+        # or its thermal state must not take the whole metric stream down --
+        # those are labels, not measurements.
+        with unittest.mock.patch.object(soltop, "machine_name",
+                                        side_effect=Exception("boom")), \
+                unittest.mock.patch.object(soltop, "thermal_state",
+                                           side_effect=Exception("boom")):
+            snap = soltop.snapshot(self._export_view(), timestamp=1234.5)
+
+        self.assertIsNone(snap["machine"])
+        self.assertIsNone(snap["thermal"])
+        # The measurements still made it out.
+        self.assertEqual(snap["gpu"]["frequency_mhz"], 618)
+        self.assertIn('soltop_gpu_frequency_mhz 618', soltop.to_prometheus(snap))
+        self.assertIn('machine="unknown"', soltop.to_prometheus(snap))
+
+    def test_serve_address_parsing(self):
+        # A bare port must NOT bind every interface: exporting hardware telemetry
+        # to the network should be a deliberate act.
+        self.assertEqual(soltop._parse_addr("9101"), ("127.0.0.1", 9101))
+        self.assertEqual(soltop._parse_addr(":9101"), ("127.0.0.1", 9101))
+        self.assertEqual(soltop._parse_addr("0.0.0.0:9101"), ("0.0.0.0", 9101))
+        for bad in ("", "nope", "9101:", "0", "65536", "1.2.3.4"):
+            with self.assertRaises(ValueError, msg=bad):
+                soltop._parse_addr(bad)
+
     def test_unknown_silicon_hides_the_clock_instead_of_faking_one(self):
         # The whole point of binding ladders by shape rather than by name: on a
         # chip whose tables we cannot read, soltop must show NO clock. A wrong

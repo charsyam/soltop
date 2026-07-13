@@ -50,6 +50,34 @@ While running:
 
 Pressing the same key again returns to the dashboard.
 
+## Machine-readable output
+
+```sh
+soltop --json                    # one JSON object per sample (JSONL)
+soltop --json --once | jq .      # a single snapshot
+soltop --csv > soltop.csv        # a header, then one row per sample
+soltop --serve 9101              # Prometheus metrics at :9101/metrics
+```
+
+`--serve` binds **loopback** unless you give an address (`--serve 0.0.0.0:9101`) —
+exporting hardware telemetry to the network should be deliberate. A background
+thread samples continuously and scrapes read the latest snapshot, so a scrape
+returns immediately and *N* scrapers cost no more than one.
+
+```
+soltop_gpu_utilization_percent 29.4
+soltop_gpu_frequency_mhz 618
+soltop_cpu_utilization_percent{cluster="P0"} 90.0
+soltop_cpu_frequency_mhz{cluster="P0"} 4380
+soltop_power_milliwatts{rail="cpu"} 1360.0
+```
+
+**An unknown clock is never exported as 0.** A parked cluster (macOS powers whole
+CPU clusters down when idle) and a chip whose ladder soltop cannot read both have
+*no* frequency — so JSON emits `null`, CSV leaves the field empty, and Prometheus
+**omits the series entirely**. A zero would average cleanly and drag a dashboard
+quietly towards nothing; an absent series is honest.
+
 ## Requirements
 
 - Apple Silicon Mac (M1 or newer)

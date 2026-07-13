@@ -1304,6 +1304,133 @@ def organize(raw):
             "power_avg": raw.get("power_avg", {}), "power_peak": raw.get("power_peak", {})}
 
 
+# --- Machine-readable output (JSON / CSV / Prometheus) -----------------------
+# One serialisable snapshot feeds all three, so they cannot drift apart.
+#
+# An unknown clock is null/absent, NEVER 0. soltop deliberately reports no
+# frequency when it cannot read a cluster's ladder, or when a cluster is parked
+# (macOS powers whole CPU clusters down when idle -- see tools/fixtures/). A 0
+# would be indistinguishable from a real reading and would drag any average
+# taken over it towards zero, quietly.
+
+def snapshot(view, timestamp):
+    """A flat, serialisable view: the one schema JSON/CSV/Prometheus share.
+
+    ``timestamp`` is passed in rather than read here so the caller controls the
+    clock (and so this stays a pure function of the view).
+    """
+    def mhz(v):
+        return round(v) if v else None       # never 0 -- see above
+
+    def best_effort(fn, default=None):
+        # An exporter is a long-lived process: a failure to read a decorative
+        # field (the machine's name, the thermal state) must not take the whole
+        # metric stream down with it.
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    return {
+        "timestamp": timestamp,
+        "soltop_version": __version__,
+        "machine": best_effort(machine_name),
+        "thermal": best_effort(lambda: THERMAL_NAMES.get(thermal_state())),
+        "gpu": {
+            "utilization_percent": round(view.get("gpu_pct", 0.0), 2),
+            "frequency_mhz": mhz(view.get("gpu_mhz")),
+        },
+        "cpu_clusters": [
+            {
+                "cluster": c["key"],
+                "cores": c["count"],
+                "utilization_percent": round(c["avg"], 2),
+                "frequency_mhz": mhz(c["mhz"]),
+                # A cluster macOS has powered down: 0% and no clock, by design.
+                "parked": c["avg"] == 0.0 and not c["mhz"],
+            }
+            for c in view.get("clusters", [])
+        ],
+        "power_mw": {k.lower(): round(v, 1)
+                     for k, v in sorted(view.get("power", {}).items())},
+    }
+
+
+def to_json(snap):
+    """One snapshot as a single JSON line (JSONL: stream-friendly, jq-friendly)."""
+    import json
+    return json.dumps(snap, separators=(",", ":"))
+
+
+def _csv_columns(snap):
+    """CSV header for this machine's shape.
+
+    The cluster set is chip-specific (an M4 Pro has E/P0/P1, an M5 Pro S/P0/P1),
+    so the columns are derived from the snapshot rather than fixed. Within one
+    run they are stable, which is what a CSV consumer actually needs.
+    """
+    cols = ["timestamp", "gpu_utilization_percent", "gpu_frequency_mhz"]
+    for c in snap["cpu_clusters"]:
+        cols += [f"cpu_{c['cluster']}_utilization_percent",
+                 f"cpu_{c['cluster']}_frequency_mhz"]
+    cols += [f"power_{rail}_mw" for rail in snap["power_mw"]]
+    return cols
+
+
+def to_csv_row(snap):
+    """One snapshot as a CSV row (an empty field where a value is unknown)."""
+    def f(v):
+        return "" if v is None else v
+
+    row = [snap["timestamp"],
+           snap["gpu"]["utilization_percent"], f(snap["gpu"]["frequency_mhz"])]
+    for c in snap["cpu_clusters"]:
+        row += [c["utilization_percent"], f(c["frequency_mhz"])]
+    row += [v for v in snap["power_mw"].values()]
+    return ",".join(str(x) for x in row)
+
+
+def to_prometheus(snap):
+    """One snapshot in the Prometheus text exposition format.
+
+    A metric whose value is unknown is OMITTED rather than exported as 0 -- an
+    absent series is honest, a zeroed one is a lie that averages cleanly.
+    """
+    out = []
+
+    def metric(name, help_text, mtype, samples):
+        # Only emit the HELP/TYPE preamble if at least one sample survived.
+        rows = [(labels, val) for labels, val in samples if val is not None]
+        if not rows:
+            return
+        out.append(f"# HELP {name} {help_text}")
+        out.append(f"# TYPE {name} {mtype}")
+        for labels, val in rows:
+            lbl = ("{" + ",".join(f'{k}="{v}"' for k, v in labels.items()) + "}"
+                   ) if labels else ""
+            out.append(f"{name}{lbl} {val}")
+
+    metric("soltop_gpu_utilization_percent", "GPU active residency.", "gauge",
+           [({}, snap["gpu"]["utilization_percent"])])
+    metric("soltop_gpu_frequency_mhz", "GPU active-residency-weighted clock.",
+           "gauge", [({}, snap["gpu"]["frequency_mhz"])])
+    metric("soltop_cpu_utilization_percent", "CPU cluster active residency.",
+           "gauge", [({"cluster": c["cluster"]}, c["utilization_percent"])
+                     for c in snap["cpu_clusters"]])
+    metric("soltop_cpu_frequency_mhz",
+           "CPU cluster active-residency-weighted clock.", "gauge",
+           [({"cluster": c["cluster"]}, c["frequency_mhz"])
+            for c in snap["cpu_clusters"]])
+    metric("soltop_cpu_cores", "Cores in the cluster.", "gauge",
+           [({"cluster": c["cluster"]}, c["cores"]) for c in snap["cpu_clusters"]])
+    metric("soltop_power_milliwatts", "Power draw by rail.", "gauge",
+           [({"rail": rail}, v) for rail, v in snap["power_mw"].items()])
+    metric("soltop_build_info", "soltop version and machine.", "gauge",
+           [({"version": snap["soltop_version"],
+              "machine": snap["machine"] or "unknown"}, 1)])
+    return "\n".join(out) + "\n"
+
+
 # --- Terminal display -------------------------------------------------------
 ESC = "\x1b["
 HIDE_CURSOR = ESC + "?25l"
@@ -1755,6 +1882,121 @@ def live(interval=1.0, cols_override=None):
         print(SHOW_CURSOR + "\n", end="", flush=True)
 
 
+def _sample_snapshots(interval):
+    """Yield a snapshot per interval, forever. Shared by stream() and serve()."""
+    sampler = Sampler()
+    try:
+        while True:
+            view = organize(sampler.read(interval))
+            yield snapshot(view, time.time())
+    finally:
+        sampler.close()
+
+
+def stream(interval=1.0, as_csv=False, once=False):
+    """Emit JSONL (or CSV) on stdout, one record per sample.
+
+    Line-buffered and flushed per record, so it pipes into `jq`, a log shipper,
+    or `tee` without the consumer waiting on a full buffer.
+    """
+    header_written = False
+    try:
+        for snap in _sample_snapshots(interval):
+            if as_csv:
+                if not header_written:
+                    print(",".join(_csv_columns(snap)), flush=True)
+                    header_written = True
+                print(to_csv_row(snap), flush=True)
+            else:
+                print(to_json(snap), flush=True)
+            if once:
+                break
+    except KeyboardInterrupt:
+        pass
+    except BrokenPipeError:
+        # `soltop --json | head -5` closes the pipe on us; that is not an error.
+        pass
+    return 0
+
+
+def _parse_addr(spec, default_host="127.0.0.1"):
+    """'9101' | ':9101' | '0.0.0.0:9101' -> (host, port). Raises on nonsense."""
+    spec = str(spec)
+    host, _, port = spec.rpartition(":")
+    if not port.isdigit():
+        raise ValueError(f"not a port: {spec!r}")
+    port = int(port)
+    if not 1 <= port <= 65535:
+        raise ValueError(f"port out of range: {port}")
+    # Bare '9101' or ':9101' -> loopback. Exporting hardware telemetry to every
+    # interface should be a deliberate act, not the default.
+    return (host or default_host, port)
+
+
+def serve(addr, interval=1.0):
+    """Serve Prometheus metrics at /metrics.
+
+    A background thread samples continuously and publishes the latest snapshot;
+    scrapes read that rather than each triggering their own `interval`-long
+    sample. So a scrape returns immediately, and N scrapers cost no more than 1.
+    """
+    import http.server
+    import threading
+
+    try:
+        host, port = _parse_addr(addr)
+    except ValueError as e:
+        import sys
+        print(f"soltop: --serve: {e}", file=sys.stderr)
+        return 2
+
+    latest = {"snap": None, "error": None}
+
+    def poll():
+        try:
+            for snap in _sample_snapshots(interval):
+                latest["snap"] = snap
+        except Exception as e:                  # the sampler died; say so on /metrics
+            latest["error"] = str(e)
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.split("?")[0] not in ("/metrics", "/"):
+                self.send_error(404)
+                return
+            snap, err = latest["snap"], latest["error"]
+            if err:
+                self.send_error(503, f"sampler failed: {err}")
+                return
+            if snap is None:                    # first sample not in yet
+                self.send_error(503, "warming up")
+                return
+            body = to_prometheus(snap).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):              # don't spam stdout per scrape
+            pass
+
+    thread = threading.Thread(target=poll, daemon=True)
+    thread.start()
+
+    httpd = http.server.ThreadingHTTPServer((host, port), Handler)
+    import sys
+    print(f"soltop {__version__}: serving metrics on http://{host}:{port}/metrics",
+          file=sys.stderr)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
+
+
 def main():
     import argparse
 
@@ -1777,13 +2019,29 @@ def main():
     p.add_argument("-c", "--cols", type=nonnegative_int, default=0,
                    help="terminal columns to use (0 = auto-fit)")
     p.add_argument("--once", action="store_true", help="print once and exit")
+    p.add_argument("--json", action="store_true",
+                   help="emit one JSON object per sample (JSONL) instead of the TUI")
+    p.add_argument("--csv", action="store_true",
+                   help="emit CSV (a header, then one row per sample)")
+    p.add_argument("--serve", metavar="[ADDR:]PORT",
+                   help="serve Prometheus metrics at /metrics (e.g. 9101, :9101, "
+                        "127.0.0.1:9101). Binds localhost unless an address is given")
     p.add_argument("--version", action="version", version=f"soltop {__version__}")
     args = p.parse_args()
     cols_override = args.cols or None
 
+    if args.json and args.csv:
+        p.error("--json and --csv are mutually exclusive")
+    if args.serve and (args.json or args.csv):
+        p.error("--serve cannot be combined with --json/--csv")
+
     # IOReport can refuse to subscribe (unsupported machine, or it simply keeps
     # failing). Report that as a message, not a Python traceback.
     try:
+        if args.serve:
+            return serve(args.serve, args.interval)
+        if args.json or args.csv:
+            return stream(args.interval, as_csv=args.csv, once=args.once)
         if args.once:
             sampler = Sampler()
             try:
