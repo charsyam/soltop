@@ -17,26 +17,36 @@ next to the system dashboard, and **without `sudo`**.
     43433       20.1    2.0    14.7    287M  Google Chrome He
 ```
 
-It reads the GPU driver's own per-client accounting out of the IORegistry, plus
-`IOReport` for the system-wide figures — so it runs with normal user privileges.
-`powermetrics --show-process-gpu` can do this too, but it needs root.
+Those are **GPU time**, not GPU memory — which process is actually keeping the
+GPU busy. soltop reads the driver's own per-client accounting out of the
+IORegistry, plus `IOReport` for the system-wide figures, so it runs with normal
+user privileges. The only other tool that answers this question is
+`powermetrics --show-process-gpu`, and it needs root.
 
 ![soltop running on an Apple M4 Pro](soltop.png)
 
 ## Why another one
 
-The Apple Silicon monitors split into two camps, and soltop is trying to be the
-overlap:
+Note the first column: **per-process GPU _utilization_**, not per-process GPU
+_memory_. Several tools will tell you how much GPU memory a process has
+allocated; what they will not tell you is which process is actually *keeping the
+GPU busy*. The only other thing that answers that is `powermetrics`, and it
+needs root.
 
-| | per-process GPU | system dashboard | no sudo |
-|---|---|---|---|
-| **soltop** | ✅ | ✅ | ✅ |
-| [macmon](https://github.com/vladkens/macmon), [mactop](https://github.com/context-labs/mactop) | ❌ | ✅ | ✅ |
-| [asitop](https://github.com/tlkh/asitop) | ❌ | ✅ | ❌ |
-| `powermetrics --show-process-gpu` | ✅ | ✅ | ❌ |
+| | per-process GPU **time** | per-process GPU **memory** | system dashboard | no sudo |
+|---|---|---|---|---|
+| **soltop** | ✅ ms/s + % | — ¹ | ✅ CPU clusters, power, thermal | ✅ |
+| [apple-smi](https://github.com/yeahdongcn/apple-smi) | ❌ device-wide only | ✅ | partial (SoC power) | ✅ |
+| [macmon](https://github.com/vladkens/macmon), [mactop](https://github.com/context-labs/mactop) | ❌ | ❌ | ✅ | ✅ |
+| [asitop](https://github.com/tlkh/asitop) | ❌ | ❌ | ✅ | ❌ |
+| `powermetrics --show-process-gpu` | ✅ | ❌ | ✅ | ❌ |
 
-If you only want a system monitor, macmon is excellent and is a single Rust
-binary. Reach for soltop when you need to know **which process** is on the GPU.
+¹ Apple Silicon memory is unified, so a process's RSS *is* what it costs the
+SoC; the GPU driver publishes no separate VRAM figure. soltop shows RSS.
+
+If you only want a system monitor, [macmon](https://github.com/vladkens/macmon)
+is excellent and is a single Rust binary. Reach for soltop when you need to know
+**which process** is on the GPU.
 
 ## Features
 
