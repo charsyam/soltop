@@ -2,7 +2,7 @@
 
 [![test](https://github.com/charsyam/soltop/actions/workflows/test.yml/badge.svg)](https://github.com/charsyam/soltop/actions/workflows/test.yml)
 
-Current version: **0.11.0**
+Current version: **0.11.1**
 
 **Which process is eating my GPU?** On Apple Silicon that question is
 surprisingly hard to answer. `soltop` answers it — with a per-process GPU table

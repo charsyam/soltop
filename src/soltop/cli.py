@@ -4,7 +4,7 @@ import sys
 
 from . import __version__
 from .core.process import ProcGPUSampler
-from .core.sampler import Sampler
+from .core.sampler import FIRST_SAMPLE_MAX_INTERVAL, Sampler
 from .core.view import organize
 from .exporter.serve import serve, stream
 from .ui import live, render, term_size
@@ -63,7 +63,7 @@ def main():
                     proc_sampler.step()  # establish the process baseline before the wait
                 except Exception:
                     proc_sampler = None
-                view = organize(sampler.read(args.interval))
+                view = organize(sampler.read(min(args.interval, FIRST_SAMPLE_MAX_INTERVAL)))
                 try:
                     procs = proc_sampler.step() if proc_sampler else []
                 except Exception:

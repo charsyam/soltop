@@ -3,7 +3,7 @@ import sys
 import time
 
 from .. import __version__
-from ..core.sampler import Sampler
+from ..core.sampler import FIRST_SAMPLE_MAX_INTERVAL, Sampler
 from ..core.view import organize
 from .formats import _csv_columns, snapshot, to_csv_row, to_json, to_prometheus
 
@@ -11,9 +11,11 @@ from .formats import _csv_columns, snapshot, to_csv_row, to_json, to_prometheus
 def _sample_snapshots(interval):
     """Yield a snapshot per interval, forever. Shared by stream() and serve()."""
     sampler = Sampler()
+    sample_interval = min(interval, FIRST_SAMPLE_MAX_INTERVAL)
     try:
         while True:
-            view = organize(sampler.read(interval))
+            view = organize(sampler.read(sample_interval))
+            sample_interval = interval
             yield snapshot(view, time.time())
     finally:
         sampler.close()

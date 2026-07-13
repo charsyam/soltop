@@ -11,7 +11,7 @@ from collections import deque
 from . import __version__
 from .core.power import POWER_LABELS
 from .core.process import ProcGPUSampler
-from .core.sampler import Sampler
+from .core.sampler import FIRST_SAMPLE_MAX_INTERVAL, Sampler
 from .core.system import THERMAL_NAMES, machine_name, mem_stats, thermal_state
 from .core.temps import die_temps
 from .core.view import organize
@@ -584,11 +584,13 @@ def live(interval=1.0, cols_override=None):
     core_only = False
     temp_only = False
     retries = 0
+    sample_interval = min(interval, FIRST_SAMPLE_MAX_INTERVAL)
     try:
         with KeyReader(sys.stdin) as keys:
             while True:
                 try:
-                    view = organize(sampler.read(interval))
+                    view = organize(sampler.read(sample_interval))
+                    sample_interval = interval
                     retries = 0
                 except RuntimeError:
                     # read() closes the Sampler and raises when IOReport keeps

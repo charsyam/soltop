@@ -53,7 +53,10 @@ class _FakeKeys:
 
 
 class _FakeSampler:
+    intervals = []
+
     def read(self, interval):
+        self.intervals.append(interval)
         return {"gpu": [], "cpu": [], "power": {"SoC": 0.0},
                 "power_avg": {}, "power_peak": {}}
 
@@ -67,7 +70,7 @@ class _FakeProcSampler:
 
 
 class LiveKeyTests(unittest.TestCase):
-    def _run_live(self, keys):
+    def _run_live(self, keys, interval=0.01):
         """Run live() against fakes, returning the process_only flag per frame."""
         seen = []
         real_render = soltop.render
@@ -81,14 +84,20 @@ class LiveKeyTests(unittest.TestCase):
                                temp_hist, ane_hist, process_only, single_sample,
                                core_only, temp_only)
 
+        _FakeSampler.intervals = []
         with unittest.mock.patch.object(soltop_ui, "Sampler", _FakeSampler), \
                 unittest.mock.patch.object(soltop_ui, "ProcGPUSampler", _FakeProcSampler), \
                 unittest.mock.patch.object(soltop_ui, "KeyReader", lambda s: _FakeKeys(keys)), \
                 unittest.mock.patch.object(soltop_ui.time, "sleep", lambda s: None), \
                 unittest.mock.patch.object(soltop_ui, "render", spy), \
                 unittest.mock.patch("sys.stdout", new_callable=io.StringIO):
-            soltop.live(interval=0.01)
+            soltop.live(interval=interval)
         return seen
+
+    def test_first_live_sample_is_short_then_uses_the_requested_interval(self):
+        self._run_live(["", "q"], interval=1.0)
+        self.assertEqual(_FakeSampler.intervals,
+                         [soltop.FIRST_SAMPLE_MAX_INTERVAL, 1.0])
 
     def test_q_quits_the_live_loop(self):
         # Without a 'q' handler this loop would never terminate.
@@ -1123,7 +1132,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.11.0")
+        self.assertEqual(soltop.__version__, "0.11.1")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200

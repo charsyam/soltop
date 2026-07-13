@@ -10,7 +10,7 @@
 need not know which module a name lives in.
 """
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 
 from .ffi import CF, IOR, IOKIT, cfstr, from_cfstr
 
@@ -23,7 +23,8 @@ from .core.dvfs import (
 )
 from .core.power import ENERGY_KEYS, POWER_LABELS, POWER_SANE_MAX_MW
 from .core.sampler import (
-    Sampler, _NOT_UTIL, _UTIL_SUBGROUPS, _fallback_state_subgroups,
+    FIRST_SAMPLE_MAX_INTERVAL, Sampler, _NOT_UTIL, _UTIL_SUBGROUPS,
+    _fallback_state_subgroups,
     build_subscription, classify_group, copy_group, discover_state_channels,
     iter_channels, read_states,
 )

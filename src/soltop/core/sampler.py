@@ -4,11 +4,14 @@ This layer only *reads* -- it hands out raw per-channel residency and energy
 deltas. What those numbers mean is decided in cpu.py / gpu.py / power.py.
 """
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from ..ffi import (CF, IOR, c_void_p, c_int, c_uint64, byref, cfstr, from_cfstr)
 from . import dvfs as _dvfs
 from .dvfs import active_ratio, load_dvfs
 from .power import ENERGY_KEYS, POWER_LABELS, POWER_SANE_MAX_MW
+
+FIRST_SAMPLE_MAX_INTERVAL = 0.2
 
 
 def copy_group(group, subgroup=None):
@@ -85,6 +88,14 @@ _UTIL_SUBGROUPS = {
     "gpu": ("GPU Performance States",),
     "cpu": ("CPU Core Performance States",),
 }
+
+# M4/M5 use these canonical group/subgroup pairs.  Try them directly before
+# scanning every IOReport channel; a future rename still falls back to the
+# discovery path below.
+_CANONICAL_UTIL_CHANNELS = (
+    ("CPU Stats", "CPU Core Performance States"),
+    ("GPU Stats", "GPU Performance States"),
+)
 # Substrings identifying subgroups that are NOT utilization, used only by the
 # fallback scan below if Apple renames the canonical subgroups above.
 
@@ -179,6 +190,29 @@ def discover_state_channels():
     return base
 
 
+def _canonical_state_channels():
+    """Copy the known M4/M5 utilization channels, or None if either is absent."""
+    refs = []
+    try:
+        # These independent calls each take about 0.1s. ctypes releases the GIL,
+        # so copying them concurrently cuts the canonical fast path nearly in half.
+        with ThreadPoolExecutor(max_workers=len(_CANONICAL_UTIL_CHANNELS)) as pool:
+            refs = list(pool.map(lambda pair: copy_group(*pair),
+                                 _CANONICAL_UTIL_CHANNELS))
+        if any(not ref or not any(iter_channels(ref)) for ref in refs):
+            return None
+        base = refs[0]
+        for ref in refs[1:]:
+            IOR.IOReportMergeChannels(base, ref, None)
+            CF.CFRelease(ref)
+        refs = []
+        return base
+    finally:
+        for ref in refs:
+            if ref:
+                CF.CFRelease(ref)
+
+
 # Energy Model channels of interest -> display label. Their delta over the
 # interval is energy consumed, so power (mW) = delta / interval_seconds.
 # "SoC" is derived as the sum of these components.
@@ -192,7 +226,7 @@ def discover_state_channels():
 
 
 def build_subscription():
-    chans = discover_state_channels()
+    chans = _canonical_state_channels() or discover_state_channels()
     # Also subscribe to the Energy Model group for CPU/GPU/ANE power (no sudo).
     energy = copy_group("Energy Model", None)
     if energy:
@@ -211,12 +245,19 @@ class Sampler:
 
     def __init__(self):
         if _dvfs.DVFS is None:
-            try:
-                _dvfs.set_tables(load_dvfs())
-            except Exception:
-                _dvfs.set_tables({})
+            # DVFS walks the IORegistry while subscription setup reads IOReport.
+            # They are independent native operations and ctypes releases the GIL,
+            # so overlap them instead of paying both startup costs serially.
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                future = pool.submit(load_dvfs)
+                self.subscribed, self.chans, self.sub = build_subscription()
+                try:
+                    _dvfs.set_tables(future.result())
+                except Exception:
+                    _dvfs.set_tables({})
+        else:
+            self.subscribed, self.chans, self.sub = build_subscription()
         self.closed = False
-        self.subscribed, self.chans, self.sub = build_subscription()
         self.prev = IOR.IOReportCreateSamples(self.subscribed, self.chans, None)
         self.prev_time = time.monotonic()
         # Retain channel metadata across samples; missing/parked channels have
