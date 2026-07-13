@@ -4,25 +4,52 @@
 
 Current version: **0.9.0**
 
-An Apple Silicon GPU / CPU / power monitor for the terminal — like `asitop`,
-but **without `sudo` and without `powermetrics`**.
+**Which process is eating my GPU?** On Apple Silicon that question is
+surprisingly hard to answer. `soltop` answers it — with a per-process GPU table
+next to the system dashboard, and **without `sudo`**.
 
-`soltop` reads directly from `IOReport`, IOKit and mach, so it runs with normal
-user privileges.
+```
+ GPU processes
+      PID   GPU ms/s   GPU%    CPU%     MEM  NAME
+      168      344.8   34.5    43.4    262M  WindowServer
+      817       41.5    4.2    10.1    155M  Microsoft Teams
+      506       33.8    3.4    35.9    916M  iTerm2
+    43433       20.1    2.0    14.7    287M  Google Chrome He
+```
+
+It reads the GPU driver's own per-client accounting out of the IORegistry, plus
+`IOReport` for the system-wide figures — so it runs with normal user privileges.
+`powermetrics --show-process-gpu` can do this too, but it needs root.
 
 ![soltop running on an Apple M4 Pro](soltop.png)
 
+## Why another one
+
+The Apple Silicon monitors split into two camps, and soltop is trying to be the
+overlap:
+
+| | per-process GPU | system dashboard | no sudo |
+|---|---|---|---|
+| **soltop** | ✅ | ✅ | ✅ |
+| [macmon](https://github.com/vladkens/macmon), [mactop](https://github.com/context-labs/mactop) | ❌ | ✅ | ✅ |
+| [asitop](https://github.com/tlkh/asitop) | ❌ | ✅ | ❌ |
+| `powermetrics --show-process-gpu` | ✅ | ✅ | ❌ |
+
+If you only want a system monitor, macmon is excellent and is a single Rust
+binary. Reach for soltop when you need to know **which process** is on the GPU.
+
 ## Features
 
+- **Per-process GPU table** — GPU ms/s and GPU%, plus each process's CPU% and
+  memory. Read from the driver's IORegistry accounting, no sudo.
 - **GPU** usage + frequency, with a live history graph
-- **Per-process GPU table** (like `nvidia-smi`), read from the driver's
-  IORegistry accounting — no sudo. Shows GPU ms/s and GPU%, plus each process's
-  CPU% and memory.
+- **CPU** clusters: usage + frequency, with core counts (press `c` for a
+  per-core breakdown). The layout is discovered, not assumed — an M4 Pro's E +
+  P0/P1 and an M5 Pro's S + P0/P1 both come out right.
 - **Power**: CPU / GPU / ANE / DRAM / Total (cur / avg / peak) + history graph
-- **CPU** E/P clusters: usage + frequency, with core counts (press `c` for a
-  per-core breakdown)
 - **Memory**: used / wired / compressed / swap
 - **Thermal / throttle** state
+- **JSON / CSV / Prometheus** output for piping and dashboards
 - Auto-fits the terminal size, boxed asitop-style UI
 
 ## Install
@@ -149,6 +176,13 @@ reasoning would have found that; the dump did, in one shot.
 - No `sudo` and no `powermetrics` dependency.
 - GPU utilization and power come from IOReport residency / energy counters;
   they track trends well but are approximations, not firmware-exact values.
+- **The per-process GPU times do not sum to the system-wide GPU%**, and are not
+  meant to. The two are measured differently: a process's figure is the GPU time
+  the driver *billed to that client*, while the system figure is hardware
+  P-state residency. Work the kernel does on its own, and anything the driver
+  does not attribute to a client, shows up in the second and not the first — so
+  the processes routinely account for only about half of the system total. Use
+  the table to rank *who* is on the GPU, and the gauge for *how busy* it is.
 - The process table's **MEM** is the process's RSS. Apple Silicon memory is
   unified, so that *is* the memory it costs the SoC — the GPU driver publishes
   no separate VRAM figure (per GPU client it exposes only the API, the
