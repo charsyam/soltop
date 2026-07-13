@@ -638,6 +638,48 @@ class SoltopLogicTests(unittest.TestCase):
         # ... and the CPU still binds its own.
         self.assertEqual(soltop.match_cpu_ladder(15, tables), [1344.0] * 15)
 
+    def test_ambiguous_cpu_ladders_report_no_clock(self):
+        # A step count matching several tables is NORMAL -- a chip's two
+        # performance clusters share a ladder (M4: voltage-states5 and 13, both
+        # 1260..4512; M5: 22 and 23, both 1344..4380). Identical candidates are
+        # no ambiguity, so the ladder is taken.
+        agree = {"voltage-states5": ("period", [1260.0, 4512.0]),
+                 "voltage-states13": ("period", [1260.0, 4512.0])}
+        self.assertEqual(soltop.match_cpu_ladder(2, agree), [1260.0, 4512.0])
+
+        # But candidates that DISAGREE mean the step count cannot say which is
+        # this cluster's. Picking the lowest-numbered would render a guess as a
+        # fact, so report no clock -- the same bargain the rest of the DVFS code
+        # makes. No chip we have data for hits this; nothing promises none will.
+        disagree = {"voltage-states5": ("period", [1260.0, 4512.0]),
+                    "voltage-states13": ("period", [1000.0, 3000.0])}
+        self.assertEqual(soltop.match_cpu_ladder(2, disagree), [])
+
+    def test_sram_twins_are_excluded_from_matching(self):
+        # Every '-sram' key duplicates its twin's ladder and so adds a spurious
+        # candidate to every match -- which is how a CPU ladder came to be
+        # offered to the GPU. A GPU table's sram twin is stored in Hz, so it even
+        # decodes as a GPU table.
+        tables = {"voltage-states9": ("gpu", [338.0, 1578.0]),
+                  "voltage-states9-sram": ("gpu", [338.0, 1578.0]),
+                  "voltage-states5": ("period", [1260.0, 4512.0]),
+                  "voltage-states5-sram": ("sram", [1260.0, 4512.0])}
+        # The twin must not make these look ambiguous...
+        self.assertEqual(soltop.match_cpu_ladder(2, tables), [1260.0, 4512.0])
+        self.assertEqual(soltop.match_gpu_ladder(tables), [338.0, 1578.0])
+
+    def test_gpu_cap_excludes_the_impostor_tables_on_both_chips(self):
+        # _GPU_MAX_MHZ cannot simply be raised "for headroom": the impostors sit
+        # at 2364 on an M4 Pro and 2004/2472 on an M5, so the usable window is
+        # roughly [1620, 2004). Raising it to 2400 was tried and immediately made
+        # the M4's voltage-states8 (744..2364) outrank the real GPU table.
+        self.assertGreater(soltop._GPU_MAX_MHZ, 1620.0)   # clears both real GPUs
+        self.assertLess(soltop._GPU_MAX_MHZ, 2004.0)      # rejects every impostor
+
+        m4 = {"voltage-states8": ("gpu", [744.0, 2364.0]),    # NOT the GPU
+              "voltage-states9": ("gpu", [338.0, 1578.0])}    # the GPU
+        self.assertEqual(soltop.match_gpu_ladder(m4), [338.0, 1578.0])
+
     def test_gpu_ignores_the_other_hz_tables(self):
         # An M5 Pro exposes several Hz tables beside the GPU's: 801..2004 and
         # 732..2472 are not GPU ladders. An Apple GPU clocks far below its CPU,
@@ -987,7 +1029,7 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(soltop._freq_txt(0.0), "")
 
     def test_version(self):
-        self.assertEqual(soltop.__version__, "0.7.3")
+        self.assertEqual(soltop.__version__, "0.8.0")
 
     def test_wrap_box_truncates_overlong_lines(self):
         long_line = "x" * 200

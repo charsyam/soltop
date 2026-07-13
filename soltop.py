@@ -10,7 +10,7 @@ import subprocess
 import time
 from collections import deque
 
-__version__ = "0.7.3"
+__version__ = "0.8.0"
 
 from ctypes import (
     c_void_p,
@@ -350,7 +350,17 @@ _SANE_MHZ = (100.0, 10_000.0)
 # An Apple GPU clocks far below its CPU (an M4 Pro tops out at 1578 MHz, an M5
 # Pro at 1620). Several unrelated Hz tables sit alongside it in the IORegistry
 # -- 801..2004 and 732..2472 on an M5 -- so a ceiling is what tells them apart.
-# Generous enough to allow for headroom on future parts.
+#
+# This is the one number here that a future chip can outgrow: it must sit above
+# every real GPU clock and below the nearest impostor, and those bounds are
+# tighter than they look. Raising it to 2400 to "leave headroom" immediately
+# broke the M4 Pro, whose voltage-states8 (744..2364) then outranked the real
+# GPU table and reported the GPU at 2364 MHz. The impostors sit at 2004/2364 on
+# an M4 and 2004/2472 on an M5, so the usable window is roughly [1620, 2004).
+#
+# When a future GPU does clock past this, its ladder is dropped and the GPU
+# shows NO frequency -- wrong, but silently-wrong is the failure we are buying
+# out of: it will not print a CPU ladder as a GPU clock (see match_gpu_ladder).
 _GPU_MAX_MHZ = 1900.0
 
 
@@ -470,6 +480,21 @@ def _rank_key(item):
     return int(m.group(1)) if m else 1 << 30
 
 
+def _is_sram(key):
+    """True for a '-sram' table.
+
+    Every '-sram' key duplicates the ladder of its non-sram twin (in kHz for the
+    CPU tables, in Hz for the GPU's), so it carries no information the twin does
+    not -- but it DOES add a spurious candidate to every match, which is how a
+    CPU ladder came to be offered to the GPU. Exclude them from matching.
+
+    This reads the key name, which the rest of this module is at pains not to do.
+    It is safe here because '-sram' is a structural suffix, not a chip-specific
+    number: a table either has a twin or it does not, on every chip seen so far.
+    """
+    return key.endswith("-sram")
+
+
 def match_cpu_ladder(nsteps, tables):
     """Pick the CPU ladder for a cluster with ``nsteps`` P-states, or [].
 
@@ -482,16 +507,40 @@ def match_cpu_ladder(nsteps, tables):
     voltage-states22/23 -- and the E-cluster key the old code hardcoded does not
     exist on that chip.
 
-    P0 and P1 have identical ladders (they differ only in voltage), so both
-    resolve to the same frequencies. That is correct: powermetrics prints the
-    same ladder for both.
+    A step count can match SEVERAL tables, and that is normal: a chip's two
+    performance clusters expose the same ladder (an M4 Pro has voltage-states5
+    and 13, both 1260..4512; an M5 Pro has 22 and 23, both 1344..4380), and
+    powermetrics likewise prints one ladder for both. So an ambiguity whose
+    candidates AGREE is not an ambiguity -- take the ladder.
+
+    But if the candidates DISAGREE, the step count alone cannot say which one is
+    this cluster's, and picking the lowest-numbered would be a guess rendered as
+    a fact. Report no clock instead, and let the caller show nothing: that is the
+    same bargain the rest of the DVFS code makes (see load_dvfs, match_gpu_ladder,
+    POWER_SANE_MAX_MW). No chip we have data for hits this, but nothing in the
+    IORegistry promises it cannot.
     """
     if not nsteps:
         return []
-    for _, (kind, ladder) in sorted(tables.items(), key=_rank_key):
-        if kind == "period" and len(ladder) == nsteps:
-            return ladder
-    return []
+    candidates = [ladder for key, (kind, ladder) in sorted(tables.items(), key=_rank_key)
+                  if kind == "period" and not _is_sram(key) and len(ladder) == nsteps]
+    return _one_ladder(candidates)
+
+
+def _one_ladder(candidates):
+    """The ladder the candidates agree on, or [] if they disagree.
+
+    Agreement is the whole test. Several tables matching is routine (two
+    performance clusters share a ladder), and identical candidates are no
+    ambiguity at all. Candidates that DIFFER mean the selector cannot tell which
+    is this cluster's -- so report no clock rather than render a guess as a fact.
+    """
+    if not candidates:
+        return []
+    first = candidates[0]
+    if any(other != first for other in candidates[1:]):
+        return []
+    return first
 
 
 def match_gpu_ladder(tables, cap_mhz=_GPU_MAX_MHZ):
@@ -511,13 +560,23 @@ def match_gpu_ladder(tables, cap_mhz=_GPU_MAX_MHZ):
         cap_mhz is some other unit's table (an M5 Pro exposes several Hz tables:
         the GPU's 338..1620, plus 801..2004 and 732..2472 which are not).
 
-    Among the candidates the lowest key number wins -- voltage-states9 on both
+    Among the survivors the lowest key number wins -- voltage-states9 on both
     chips we have data for.
+
+    KNOWN WEAKNESS: unlike the CPU, the GPU has no per-cluster step count to
+    match against, so this cannot fall back on "if the candidates disagree,
+    report nothing" -- the surviving Hz tables genuinely differ (an M4 Pro keeps
+    338..1578 in voltage-states9 and 14, and an unrelated 338..1470 in 31), and
+    refusing to choose would drop the GPU clock on hardware where it is correct
+    today. So this ranks rather than abstains, and cap_mhz is a bound on Apple's
+    GPU clocks rather than anything the IORegistry asserts. If a future GPU
+    clocks past cap_mhz its ladder is dropped and the GPU shows no frequency --
+    wrong, but silent-wrong is what we are avoiding: it will not report a CPU
+    ladder as a GPU clock, which is the failure this replaced.
     """
-    for _, (kind, ladder) in sorted(tables.items(), key=_rank_key):
-        if kind == "gpu" and ladder[-1] <= cap_mhz:
-            return ladder
-    return []
+    candidates = [ladder for key, (kind, ladder) in sorted(tables.items(), key=_rank_key)
+                  if kind == "gpu" and not _is_sram(key) and ladder[-1] <= cap_mhz]
+    return candidates[0] if candidates else []
 
 
 _VP_RE = re.compile(r"^V(\d+)P(\d+)$")   # CPU: V ascends with the step, P descends
