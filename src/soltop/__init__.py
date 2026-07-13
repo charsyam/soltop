@@ -10,7 +10,7 @@
 need not know which module a name lives in.
 """
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 from .ffi import CF, IOR, IOKIT, cfstr, from_cfstr
 
