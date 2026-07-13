@@ -1,5 +1,7 @@
 # soltop
 
+[![test](https://github.com/charsyam/soltop/actions/workflows/test.yml/badge.svg)](https://github.com/charsyam/soltop/actions/workflows/test.yml)
+
 Current version: **0.7.3**
 
 An Apple Silicon GPU / CPU / power monitor for the terminal — like `asitop`,
@@ -52,6 +54,36 @@ Pressing the same key again returns to the dashboard.
 
 - Apple Silicon Mac (M1 or newer)
 - macOS with the system `python3`
+
+## Which Macs are verified
+
+Frequencies are calibrated against `sudo powermetrics` on real hardware, and
+Apple's IORegistry naming changes between generations — so "it runs" and "the
+numbers are right" are different claims. What has actually been checked against
+ground truth:
+
+| chip | frequencies | clusters | power |
+|---|---|---|---|
+| M4 Pro | ✅ verified | ✅ E + P0/P1 | ✅ verified |
+| M5 Pro | ✅ verified | ✅ S + P0/P1 | ✅ verified |
+| everything else | ⚠️ unverified | ⚠️ unverified | ⚠️ unverified |
+
+soltop is built to **degrade honestly** — on silicon whose tables it cannot
+read it shows no clock rather than a wrong one — but that is a design goal, not
+a measurement.
+
+**Running an M1/M2/M3, or a Max/Ultra?** Two commands make your chip verified,
+and take a minute:
+
+```sh
+python3 tools/dump_dvfs.py > mychip.txt
+sudo powermetrics --samplers cpu_power -i 1000 -n 2 | grep "HW active frequency"
+```
+
+Open an issue with both outputs. That is exactly how M5 Pro support was built —
+it turned out to have no efficiency cores at all, and to name its *Super* cores
+`PCPU*`, the same prefix an M4 uses for its *performance* cores. No amount of
+reasoning would have found that; the dump did, in one shot.
 
 ## Notes / accuracy
 
