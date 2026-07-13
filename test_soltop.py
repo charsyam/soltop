@@ -8,6 +8,26 @@ import unittest.mock
 import soltop
 
 
+def _has_ioreport():
+    """True if this machine exposes real IOReport CPU/GPU state channels.
+
+    A virtualised macOS runner (GitHub Actions) is arm64 and has the IOReport
+    library, but no GPU/CPU state channels behind it -- so anything constructing
+    a real Sampler cannot run there. Those tests skip rather than fail: they are
+    reporting the absence of hardware, not a defect.
+    """
+    try:
+        soltop.Sampler().close()
+        return True
+    except Exception:
+        return False
+
+
+HAS_IOREPORT = _has_ioreport()
+needs_hardware = unittest.skipUnless(
+    HAS_IOREPORT, "no real IOReport CPU/GPU state channels (virtualised host?)")
+
+
 class _FakeKeys:
     """Stands in for KeyReader, replaying one canned read per frame."""
 
@@ -109,6 +129,7 @@ class LiveKeyTests(unittest.TestCase):
 
 
 class LiveRecoveryTests(unittest.TestCase):
+    @needs_hardware
     def test_live_survives_a_transient_sampler_failure(self):
         # read() closes the Sampler and raises when IOReport keeps failing. live()
         # caught only KeyboardInterrupt, so that hardening turned a transient
@@ -141,6 +162,7 @@ class LiveRecoveryTests(unittest.TestCase):
         self.assertGreater(calls["n"], 2, "should have sampled past the failure")
 
 
+    @needs_hardware
     def test_live_gives_up_instead_of_spinning_on_a_persistent_failure(self):
         # Retrying forever would rebuild the subscription (an
         # IOReportCopyAllChannels scan over ~11k channels) several times a second
@@ -459,6 +481,7 @@ class ProcTableFormattingTests(unittest.TestCase):
         self.assertIn("app", out)
 
 
+@needs_hardware
 class SamplerLifecycleTests(unittest.TestCase):
     def test_failed_resubscribe_closes_instead_of_leaving_a_zombie(self):
         # _release() nulls every pointer, so if build_subscription() then raises,
@@ -728,16 +751,13 @@ class SoltopLogicTests(unittest.TestCase):
                        (3.0, True)):             # M5 Pro 'GPU'
             self.assertEqual(mw <= soltop.POWER_SANE_MAX_MW, ok, mw)
 
+    @needs_hardware
     def test_power_filter_engages_on_the_real_read_path(self):
         # Not just the constant -- the filter has to be applied where the energy
         # delta is actually turned into a wattage. Aim a label at 'GPU Energy'
         # (which counts in uJ) and drive a real Sampler.read: the GPU must report
         # nothing rather than the ~272 kW that channel reads as.
-        try:
-            sampler = soltop.Sampler()
-        except Exception as e:                      # not on Apple Silicon
-            self.skipTest(f"IOReport unavailable: {e}")
-
+        sampler = soltop.Sampler()
         saved = soltop.ENERGY_KEYS
         try:
             soltop.ENERGY_KEYS = {"CPU Energy": "CPU", "GPU Energy": "GPU"}

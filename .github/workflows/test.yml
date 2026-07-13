@@ -35,14 +35,17 @@ jobs:
       - name: Test
         run: python3 -m unittest test_soltop -v
 
-      - name: Smoke-test the real binary
-        run: |
-          python3 soltop.py --version
-          python3 soltop.py --once
+      - name: Smoke-test the CLI
+        run: python3 soltop.py --version
 
-      - name: Diagnostics (informational -- a CI runner is virtualised, and its
-          IOReport may not look like real hardware's)
+      # A GitHub macOS runner is arm64 but virtualised: it has the IOReport
+      # library and no CPU/GPU state channels behind it, so anything that reads
+      # real hardware cannot work there. Those tests skip themselves (see
+      # needs_hardware in test_soltop.py); these steps are informational, and a
+      # failure here says nothing about soltop.
+      - name: Read real hardware (informational -- expected to fail on a runner)
         continue-on-error: true
         run: |
+          python3 soltop.py --once
           python3 tools/dump_dvfs.py
           python3 tools/dump_clusters.py
