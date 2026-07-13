@@ -710,6 +710,57 @@ class SoltopLogicTests(unittest.TestCase):
         # shorter ladder and yield a plausible wrong clock.
         self.assertEqual(soltop._nsteps([{"states": {"V0P1": 1}}] + core), 3)
 
+    def test_unknown_silicon_hides_the_clock_instead_of_faking_one(self):
+        # The whole point of binding ladders by shape rather than by name: on a
+        # chip whose tables we cannot read, soltop must show NO clock. A wrong
+        # number is worse than a missing one -- an M5 Pro would have rendered the
+        # S-cluster's ladder as the P-cluster's and nobody would have noticed.
+        sub = "CPU Core Performance States"
+        cores = [{"name": "XCPU00", "subgroup": sub, "active": 0.5,
+                  "states": {"IDLE": 50, "V0P1": 25, "V1P0": 25}}]
+
+        saved = soltop.DVFS
+        try:
+            # No tables at all (a future chip that renames voltage-states*).
+            soltop.DVFS = {}
+            v = soltop.organize({"gpu": [], "cpu": cores})
+            c = v["clusters"][0]
+            self.assertEqual(c["mhz"], 0.0)
+            self.assertEqual(soltop._freq_txt(c["mhz"]), "")
+            # Utilization still works -- it does not depend on the DVFS tables.
+            self.assertEqual(c["avg"], 50.0)
+
+            # Tables exist but none has this cluster's step count: still no clock.
+            soltop.DVFS = {"voltage-states5": ("period", [1000.0] * 19)}
+            c = soltop.organize({"gpu": [], "cpu": cores})["clusters"][0]
+            self.assertEqual(c["mhz"], 0.0)
+            self.assertEqual(c["avg"], 50.0)
+        finally:
+            soltop.DVFS = saved
+
+    def test_m5_pro_18_core_variant(self):
+        # The 18-core M5 Pro is 6 Super + 12 Performance. The layout is derived
+        # from the names, so this needs no code change -- pin it so it stays that
+        # way: 6 single-digit names stay ONE cluster, 12 two-digit names split on
+        # the leading digit.
+        def cores(names, nsteps):
+            states = {"IDLE": 1}
+            states.update({f"V{i}P{nsteps - 1 - i}": 1 for i in range(nsteps)})
+            return [{"name": n, "subgroup": "CPU Core Performance States",
+                     "active": 0.0, "states": dict(states)} for n in names]
+
+        saved = soltop.DVFS
+        try:
+            soltop.DVFS = {"voltage-states5": ("period", [1308.0] + [4608.0] * 19),
+                           "voltage-states22": ("period", [1344.0] + [4380.0] * 14)}
+            got = soltop.group_clusters(
+                cores([f"PCPU{i}" for i in range(6)], 20) +
+                cores([f"MCPU{c}{i}" for c in (0, 1) for i in range(6)], 15))
+            self.assertEqual([(c["key"], len(c["cores"])) for c in got],
+                             [("S", 6), ("P0", 6), ("P1", 6)])
+        finally:
+            soltop.DVFS = saved
+
     def test_m5_pro_topology_end_to_end(self):
         # An M5 Pro as powermetrics reports it: an S-cluster and TWO P-clusters,
         # no E-cluster at all, with P1 fully powered down. Each cluster must bind

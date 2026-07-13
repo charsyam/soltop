@@ -65,11 +65,22 @@ Pressing the same key again returns to the dashboard.
 - **Frequencies are exact MHz**, for GPU and CPU alike. The GPU's
   `voltage-states` table holds plain Hz; the CPU's holds the *period* of each
   step, so `MHz = 65532288 / raw`. Verified against
-  `sudo powermetrics --samplers cpu_power`: every step of both CPU ladders it
-  prints is reproduced exactly.
+  `sudo powermetrics --samplers cpu_power` on an **M4 Pro and an M5 Pro**: every
+  step of every CPU ladder it prints is reproduced exactly.
 - The reported clock is the **active-residency-weighted** one — `powermetrics`'
   "HW active frequency", i.e. the clock a core runs at while it is actually
   running, with idle excluded.
+- **The cluster layout is discovered, never assumed.** Apple's IORegistry
+  naming is not stable across chips: an M5 Pro has no efficiency cores at all
+  (5 Super + 10 Performance), keeps its ladders under different
+  `voltage-states` keys than an M4, and names its *Super* cores `PCPU*` — the
+  same prefix an M4 uses for its *performance* cores. soltop therefore binds
+  each cluster to its ladder by matching shape, and ranks the E/P/S tiers by
+  their measured ceiling. On silicon it cannot read, it shows **no clock**
+  rather than a fabricated one; utilization keeps working regardless. The raw
+  captures behind this are in [`tools/fixtures/`](tools/fixtures/).
+- A cluster that reads **0% with no clock is parked**, not broken — macOS powers
+  whole CPU clusters down when idle.
 
 ## License
 
