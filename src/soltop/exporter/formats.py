@@ -52,6 +52,10 @@ def snapshot(view, timestamp):
         ],
         "power_mw": {k.lower(): round(v, 1)
                      for k, v in sorted(view.get("power", {}).items())},
+        # SoC die, NOT a GPU temperature -- see core/temps.py. Absent (not 0)
+        # when no die sensor can be read.
+        "soc_temp_celsius": ({k: round(v, 1) for k, v in view["soc_temp"].items()}
+                             if view.get("soc_temp") else None),
     }
 
 
@@ -73,6 +77,7 @@ def _csv_columns(snap):
         cols += [f"cpu_{c['cluster']}_utilization_percent",
                  f"cpu_{c['cluster']}_frequency_mhz"]
     cols += [f"power_{rail}_mw" for rail in snap["power_mw"]]
+    cols += ["soc_temp_max_celsius", "soc_temp_avg_celsius"]
     return cols
 
 
@@ -86,6 +91,8 @@ def to_csv_row(snap):
     for c in snap["cpu_clusters"]:
         row += [c["utilization_percent"], f(c["frequency_mhz"])]
     row += [v for v in snap["power_mw"].values()]
+    t = snap["soc_temp_celsius"] or {}
+    row += [f(t.get("max")), f(t.get("avg"))]
     return ",".join(str(x) for x in row)
 
 
@@ -124,6 +131,11 @@ def to_prometheus(snap):
            [({"cluster": c["cluster"]}, c["cores"]) for c in snap["cpu_clusters"]])
     metric("soltop_power_milliwatts", "Power draw by rail.", "gauge",
            [({"rail": rail}, v) for rail, v in snap["power_mw"].items()])
+    temp = snap["soc_temp_celsius"] or {}
+    metric("soltop_soc_temperature_celsius",
+           "SoC die temperature. NOT a GPU temperature -- no GPU-specific "
+           "sensor is exposed; see core/temps.py.", "gauge",
+           [({"stat": "max"}, temp.get("max")), ({"stat": "avg"}, temp.get("avg"))])
     metric("soltop_build_info", "soltop version and machine.", "gauge",
            [({"version": snap["soltop_version"],
               "machine": snap["machine"] or "unknown"}, 1)])

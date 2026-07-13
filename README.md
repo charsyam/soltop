@@ -61,7 +61,7 @@ is excellent and is a single Rust binary. Reach for soltop when you need to know
   P0/P1 and an M5 Pro's S + P0/P1 both come out right.
 - **Power**: CPU / GPU / ANE / DRAM / Total (cur / avg / peak) + history graph
 - **Memory**: used / wired / compressed / swap
-- **Thermal / throttle** state
+- **SoC die temperature** (max / avg) + thermal / throttle state
 - **JSON / CSV / Prometheus** output for piping and dashboards
 - Auto-fits the terminal size, boxed asitop-style UI
 
@@ -139,6 +139,7 @@ src/soltop/
     gpu.py          GPU utilization and clock
     process.py      per-process GPU time
     system.py       memory, model name, thermal state
+    temps.py        SoC die temperature (NOT a GPU temperature -- see the module)
     view.py         stitches cpu/gpu/power into the dict everything else consumes
   exporter/         JSON, CSV, Prometheus
   ui.py             terminal rendering and the live loop
@@ -200,6 +201,13 @@ reasoning would have found that; the dump did, in one shot.
   (compositing, a stray frame) wakes the GPU for a moment, and the ramp in and
   out counts as awake without being anyone's work. Under sustained load the GPU
   never sleeps, that overhead vanishes, and the two agree.
+- **The temperature is the SoC die, not the GPU** — and no tool can give you a
+  real GPU temperature on this hardware. There is no GPU-specific sensor: pinning
+  the GPU with a Metal compute kernel on an M4 Pro moves the die sensors by about
+  **+1 °C**, while pinning the CPU moves the same sensors by **+13 °C**. Other
+  monitors look for a sensor whose *name* contains "GPU" and quietly report
+  `0.0` when (as here) there is none. soltop reports the die, calls it `SoC`, and
+  shows the **max** — the hottest spot is what the thermal governor reacts to.
 - The process table's **MEM** is the process's RSS. Apple Silicon memory is
   unified, so that *is* the memory it costs the SoC — the GPU driver publishes
   no separate VRAM figure (per GPU client it exposes only the API, the

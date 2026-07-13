@@ -271,14 +271,21 @@ def render(view, cols=80, gpu_hist=None, procs=None, height=None, soc_hist=None,
     width = bar_width_for(cols)
     lines = []
 
-    # Box title: app name + machine name + thermal/throttle state.
+    # Box title: app name + machine name + SoC die temperature + thermal state.
     title = f"Soltop v{__version__} · {machine_name()}"
+    temp = view.get("soc_temp") or {}
+    if temp:
+        # The die's hottest spot is what the thermal governor reacts to, so lead
+        # with max and colour on it. NOT a GPU temperature -- see core/temps.py.
+        hot = temp["max"]
+        ccol = "\x1b[92m" if hot < 70 else "\x1b[93m" if hot < 90 else "\x1b[91m"
+        title += f"   SoC {ccol}{hot:.0f}°C{RESET} (avg {temp['avg']:.0f})"
     ts = thermal_state()
     if ts >= 0:
         tcolor = {0: "\x1b[92m", 1: "\x1b[93m", 2: "\x1b[91m", 3: "\x1b[91m"}.get(ts, "")
         tname = THERMAL_NAMES.get(ts, "?")
         thr = " throttling" if ts >= 1 else ""
-        title += f"   thermal: {tcolor}{tname}{thr}{RESET}"
+        title += f"   {tcolor}{tname}{thr}{RESET}"
 
     def _fit(lines, title):
         """Pad/clip content to the frame and draw the border."""

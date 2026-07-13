@@ -38,6 +38,7 @@ from .core.process import (
 from .core.system import (
     THERMAL_NAMES, machine_name, mem_stats, thermal_state,
 )
+from .core.temps import die_temps, soc_temp
 from .core.view import organize
 
 from .exporter.formats import (

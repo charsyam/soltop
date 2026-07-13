@@ -12,6 +12,7 @@ from soltop.core import dvfs as soltop_dvfs
 from soltop.core import power as soltop_power
 from soltop.core import sampler as soltop_sampler
 from soltop.core import process as soltop_proc
+from soltop.core import temps as soltop_temps
 from soltop.exporter import formats as soltop_formats
 
 
@@ -899,6 +900,47 @@ class SoltopLogicTests(unittest.TestCase):
         self.assertEqual(snap["gpu"]["frequency_mhz"], 618)
         self.assertIn('soltop_gpu_frequency_mhz 618', soltop.to_prometheus(snap))
         self.assertIn('machine="unknown"', soltop.to_prometheus(snap))
+
+    def test_soc_temp_is_not_a_gpu_temperature(self):
+        # This machine exposes no GPU-specific sensor, and the die sensors barely
+        # notice the GPU: pinning it with a Metal kernel moves them ~+1 C, while
+        # pinning the CPU moves the same sensors +13 C. Other tools look for a
+        # sensor whose NAME contains "GPU" and silently report 0.0 when there is
+        # none. soltop reports the SoC die and says so -- in the label, the JSON
+        # key, and the Prometheus HELP text.
+        snap = soltop.snapshot(self._export_view(), timestamp=1234.5)
+        self.assertIn("soc_temp_celsius", snap)
+        self.assertNotIn("gpu_temp", soltop.to_json(snap))
+        text = soltop.to_prometheus(snap)
+        if "soltop_soc_temperature_celsius" in text:
+            self.assertIn("NOT a GPU temperature", text)
+
+    def test_soc_temp_is_absent_rather_than_zero_when_unreadable(self):
+        # A machine with no readable die sensor must report NOTHING, not 0 C --
+        # a zero would look like a very cold chip and would average cleanly.
+        with unittest.mock.patch.object(soltop_temps, "die_temps", return_value=[]):
+            self.assertEqual(soltop_temps.soc_temp(), {})
+
+        view = dict(self._export_view())
+        view["soc_temp"] = {}
+        snap = soltop.snapshot(view, timestamp=1234.5)
+        self.assertIsNone(snap["soc_temp_celsius"])
+        self.assertIn('"soc_temp_celsius":null', soltop.to_json(snap))
+        # Prometheus omits the series entirely rather than exporting a 0.
+        self.assertNotIn("soltop_soc_temperature_celsius",
+                         soltop.to_prometheus(snap))
+        # CSV leaves the fields empty.
+        cols = soltop._csv_columns(snap)
+        got = dict(zip(cols, soltop.to_csv_row(snap).split(",")))
+        self.assertEqual(got["soc_temp_max_celsius"], "")
+
+    def test_die_sensors_exclude_the_non_die_ones(self):
+        # 'PMU tcal' sits pinned at 51.82 C under any load (a calibration
+        # constant, not a temperature), and the battery and NAND are not the die.
+        self.assertTrue(soltop_temps._DIE_RE.match("PMU tdie1"))
+        self.assertTrue(soltop_temps._DIE_RE.match("PMU tdie14"))
+        for name in ("PMU tcal", "gas gauge battery", "NAND CH0 temp", "GPU"):
+            self.assertIsNone(soltop_temps._DIE_RE.match(name), name)
 
     def test_serve_address_parsing(self):
         # A bare port must NOT bind every interface: exporting hardware telemetry

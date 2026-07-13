@@ -7,6 +7,7 @@ and the exporters consume.
 
 from .cpu import cpu_view
 from .gpu import gpu_view
+from .temps import soc_temp
 
 
 def organize(raw):
@@ -21,4 +22,5 @@ def organize(raw):
         "power": raw.get("power", {}),
         "power_avg": raw.get("power_avg", {}),
         "power_peak": raw.get("power_peak", {}),
+        "soc_temp": soc_temp(),
     }
