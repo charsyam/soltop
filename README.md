@@ -27,22 +27,25 @@ user privileges. The only other tool that answers this question is
 
 ## Why another one
 
-Note the first column: **per-process GPU _utilization_**, not per-process GPU
-_memory_. Several tools will tell you how much GPU memory a process has
-allocated; what they will not tell you is which process is actually *keeping the
-GPU busy*. The only other thing that answers that is `powermetrics`, and it
-needs root.
+The column that matters is the first one: **per-process GPU _time_** — which
+process is actually keeping the GPU busy. The only other thing that answers that
+is `powermetrics --show-process-gpu`, and it needs root.
 
-| | per-process GPU **time** | per-process GPU **memory** | system dashboard | no sudo |
-|---|---|---|---|---|
-| **soltop** | ✅ ms/s + % | — ¹ | ✅ CPU clusters, power, thermal | ✅ |
-| [apple-smi](https://github.com/yeahdongcn/apple-smi) | ❌ device-wide only | ✅ | partial (SoC power) | ✅ |
-| [macmon](https://github.com/vladkens/macmon), [mactop](https://github.com/context-labs/mactop) | ❌ | ❌ | ✅ | ✅ |
-| [asitop](https://github.com/tlkh/asitop) | ❌ | ❌ | ✅ | ❌ |
-| `powermetrics --show-process-gpu` | ✅ | ❌ | ✅ | ❌ |
+| | per-process GPU **time** | system dashboard | no sudo |
+|---|---|---|---|
+| **soltop** | ✅ ms/s + % | ✅ CPU clusters, power, thermal | ✅ |
+| [apple-smi](https://github.com/yeahdongcn/apple-smi) | ❌ device-wide only ¹ | partial (SoC power) | ✅ |
+| [macmon](https://github.com/vladkens/macmon), [mactop](https://github.com/context-labs/mactop) | ❌ | ✅ | ✅ |
+| [asitop](https://github.com/tlkh/asitop) | ❌ | ✅ | ❌ |
+| `powermetrics --show-process-gpu` | ✅ | ✅ | ❌ |
 
-¹ Apple Silicon memory is unified, so a process's RSS *is* what it costs the
-SoC; the GPU driver publishes no separate VRAM figure. soltop shows RSS.
+¹ apple-smi does have a per-process table, but the figure in its "GPU Memory
+Usage" column is the process's **RSS**, shelled out of `ps` — not GPU memory. No
+tool can report true per-process GPU memory on this hardware: the driver's client
+nodes expose only `IOUserClientCreator`, `AppUsage` and `CommandQueueCount`, and
+no memory figure at all. soltop reports that same RSS and calls it **MEM**,
+because Apple Silicon memory is unified and a process's RSS *is* what it costs
+the SoC.
 
 If you only want a system monitor, [macmon](https://github.com/vladkens/macmon)
 is excellent and is a single Rust binary. Reach for soltop when you need to know
